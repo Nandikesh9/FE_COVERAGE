@@ -1,8 +1,5 @@
-`ifndef KB_FWD_ENG_COVERAGE_SV
-`define KB_FWD_ENG_COVERAGE_SV
-
 import kb_cxl_pkg::*;
-import com_axi 
+
 
 class kb_fwd_eng_coverage extends uvm_component;
 
@@ -17,9 +14,61 @@ class kb_fwd_eng_coverage extends uvm_component;
   kb_axi4_analysis_fifo w_fifo;
   kb_axi4_analysis_fifo resp_fifo;
 
-  kb_apb3_vendor_txn_t  h_apb_txns;
-  kb_cxl_m2s_snap       h_cxl_m2s_items;
-  kb_cxl_s2m_snap       h_cxl_s2m_items;
+  //kb_apb3_vendor_txn_t  h_apb_txns;
+  //kb_cxl_m2s_snap       h_cxl_m2s_items;
+  //kb_cxl_s2m_snap       h_cxl_s2m_items;
+  //kb_axi4_vendor_txn_t  h_axi_txns;
+  //AXI Struct's
+  // Local AXI comparison types (QoS and burst are not checked).
+  typedef struct packed {
+    bit         valid;
+    bit [7:0]   id;      
+    bit [63:0]  addr;    
+    bit [7:0]   len;     
+    bit [7:0]   size;    
+    bit [127:0] user;    
+  } axi_aw_src_t;
+
+  typedef struct packed {
+    bit          valid;
+    bit [1023:0] data;   
+    bit [127:0]  strb;   
+    bit          last;
+    bit [127:0]  user;   
+  } axi_w1024_src_t;
+
+  typedef struct packed {
+    bit         valid;
+    bit [7:0]   id;      
+    bit [63:0]  addr;    
+    bit [7:0]   len;     
+    bit [7:0]   size;    // Custom integrated field
+    bit [127:0] user;    
+  } axi_ar_src_t;
+
+  typedef struct packed {
+    bit         valid;
+    bit [7:0]   id;     
+    bit [1:0]   resp;   
+    bit [127:0] user;   
+  } axi_b_src_t;
+
+  typedef struct packed {
+    bit          valid;
+    bit [7:0]    id;
+    bit [1023:0] data;   
+    bit [1:0]    resp;
+    bit          last;
+    bit [127:0]  user;   
+  } axi_r1024_src_t;
+
+  //
+  axi_aw_src_t aw;
+  axi_w1024_src_t w;
+  axi_ar_src_t ar;
+  axi_b_src_t b;
+  axi_r1024_src_t r;
+
 
   // This component currently observes FE inputs only: APB configuration and
   // CXL M2S traffic. Internal error_response_type and FE outputs are checked
@@ -763,7 +812,51 @@ class kb_fwd_eng_coverage extends uvm_component;
     }
   endgroup : cg_credit_counters
 
+  // -------------------------------------------------------------------------
+  // AXI Address Channel Covergroups (AW / AR)
+  // -------------------------------------------------------------------------
+  covergroup cg_axi_aw;
+    option.per_instance = 1;
+    cp_id   : coverpoint aw.id { bins ids[4] = {[0:3]}; } // Tag FIFOs map to IDs 0-3[cite: 6]
+    cp_len  : coverpoint aw.len { bins single_beat = {0}; } // CXL FE transactions are single beat[cite: 6]
+    cp_size : coverpoint aw.size { bins size_64b = {6}; bins size_128b = {7}; } // 64B encoding
+  endgroup
 
+  covergroup cg_axi_ar;
+    option.per_instance = 1;
+    cp_id   : coverpoint ar.id { bins ids[4] = {[0:3]}; } 
+    cp_len  : coverpoint ar.len { bins single_beat = {0}; }
+    cp_size : coverpoint ar.size { bins size_64b = {6}; bins size_128b = {7}; }
+  endgroup
+
+  // -------------------------------------------------------------------------
+  // AXI Data & Response Channel Covergroups (W, B, R)
+  // -------------------------------------------------------------------------
+  covergroup cg_axi_w;
+    option.per_instance = 1;
+    cp_last : coverpoint w.last { bins asserted = {1'b1}; }
+  endgroup
+
+  covergroup cg_axi_b;
+    option.per_instance = 1;
+    cp_id   : coverpoint b.id { bins ids[4] = {[0:3]}; }
+    cp_resp : coverpoint b.resp { 
+      bins okay   = {2'b01};
+      bins slverr = {2'b11};
+      //bins decerr = {2'b11};
+    }
+  endgroup
+
+  covergroup cg_axi_r;
+    option.per_instance = 1;
+    cp_id   : coverpoint r.id { bins ids[4] = {[0:3]}; }
+    cp_last : coverpoint r.last { bins asserted = {1'b1}; }
+    cp_resp : coverpoint r.resp { 
+      bins okay   = {2'b01};
+      bins slverr = {2'b11};
+      //bins decerr = {2'b11};
+    }
+  endgroup
 
   extern function new(string name = "kb_fwd_eng_coverage",
                       uvm_component parent = null);
@@ -772,12 +865,18 @@ class kb_fwd_eng_coverage extends uvm_component;
   extern function void reset_config_shadow();
   extern task apb();
   extern task cxl_configure();
+  extern task axi_configure();
   //extern function void sample_all_credits();
   extern function void sample_req_inputs(kb_cxl_m2s_snap snap);
   extern function void sample_rwd_inputs(kb_cxl_m2s_snap snap);
   extern function void sample_ndr_outputs(kb_cxl_s2m_snap snap);
   extern function void sample_drc_outputs(kb_cxl_s2m_snap snap);
   extern task apb_configure(kb_apb3_vendor_txn_t txn);
+  extern function void convert_to_aw(kb_axi4_vendor_txn_t txn);
+  extern function void convert_to_ar(kb_axi4_vendor_txn_t txn);
+  extern function void convert_to_w(kb_axi4_vendor_txn_t txn);
+  extern function void convert_to_b(kb_axi4_vendor_txn_t txn);
+  extern function void convert_to_r(kb_axi4_vendor_txn_t txn);
 
 endclass : kb_fwd_eng_coverage
 
@@ -794,9 +893,9 @@ function kb_fwd_eng_coverage::new(
   cxl_s2m_bus_fifo = new("h_cxl_s2m", this);
 
   //axi fifo's
-  address_fifo = new("address_fifo", this);
-  w_fifo = new("w_fifo", this);
-  resp_fifo = new("resp_fifo", this);
+  address_fifo    = new("address_fifo", this);
+  w_fifo          = new("w_fifo", this);
+  resp_fifo       = new("resp_fifo", this);
 
   //cover groups
   cg_req_packet             = new();
@@ -808,6 +907,11 @@ function kb_fwd_eng_coverage::new(
   cg_m2s_link               = new();
   cg_s2m_link               = new();
   cg_credit_counters        = new();
+  cg_axi_aw                 = new();
+  cg_axi_w                  = new();
+  cg_axi_b                  = new();
+  cg_axi_ar                 = new();
+  cg_axi_r                  = new();
 
   reset_seen = 1'b0;
   reset_config_shadow();
@@ -829,12 +933,14 @@ task kb_fwd_eng_coverage::run_phase(uvm_phase phase);
   fork
     apb();
     cxl_configure();
-    //sample_all_credits();
+    axi_configure();
   join_none
 endtask : run_phase
 
 task kb_fwd_eng_coverage::apb();
   forever begin
+    kb_apb3_vendor_txn_t  h_apb_txns;
+
     apb_fifo.get(h_apb_txns);
     apb_configure(h_apb_txns);
   end
@@ -842,6 +948,9 @@ endtask : apb
 
 task kb_fwd_eng_coverage::cxl_configure();
   forever begin
+    kb_cxl_m2s_snap       h_cxl_m2s_items;
+    kb_cxl_s2m_snap       h_cxl_s2m_items;
+
     cxl_m2s_bus_fifo.get(h_cxl_m2s_items);
     cxl_s2m_bus_fifo.get(h_cxl_s2m_items);
 
@@ -873,6 +982,36 @@ task kb_fwd_eng_coverage::cxl_configure();
     sample_drc_outputs(h_cxl_s2m_items);
   end
 endtask : cxl_configure
+
+task kb_fwd_eng_coverage::axi_configure();
+  forever begin
+    kb_axi4_vendor_txn_t  h_axi_txns;
+    
+    address_fifo.get(h_axi_txns);
+    if (h_axi_txns.Direction == DENALI_CDN_AXI_DIRECTION_WRITE)
+      convert_to_aw(h_axi_txns);
+    else
+      convert_to_ar(h_axi_txns);
+  end
+
+  forever begin
+    kb_axi4_vendor_txn_t  h_axi_txns;
+    w_fifo.get(h_axi_txns);
+    if (h_axi_txns.Direction == DENALI_CDN_AXI_DIRECTION_WRITE)
+      convert_to_w(h_axi_txns);
+  end
+
+  forever begin
+    kb_axi4_vendor_txn_t  h_axi_txns;
+    resp_fifo.get(h_axi_txns);
+    if (h_axi_txns.Direction == DENALI_CDN_AXI_DIRECTION_WRITE)
+      convert_to_b(h_axi_txns);
+    else
+      convert_to_r(h_axi_txns);
+  end
+
+endtask : axi_configure
+
 
 //====================================================================
 // TODO: Need to discuss how to get the credit counters from scoreboard
@@ -1125,6 +1264,98 @@ task kb_fwd_eng_coverage::apb_configure(
   endcase
   cg_apb_config.sample();
 endtask : apb_configure
+
+// ---------------------------------------------------------------------------
+// AXI Denali VIP to Local Struct Conversions & Sampling
+// ---------------------------------------------------------------------------
+function void kb_fwd_eng_coverage::convert_to_aw(kb_axi4_vendor_txn_t txn);
+  if (txn.Direction == DENALI_CDN_AXI_DIRECTION_WRITE) begin
+    aw.valid = 1'b1;
+    aw.addr  = txn.StartAddress;
+    aw.len   = txn.Alen;
+    aw.size  = txn.Size - 1;
+    aw.id    = txn.IdTag;
+    
+    aw.user = '0;
+    foreach (txn.Auser[i]) begin
+      aw.user[(i * 32) +: 32] = txn.Auser[i];
+    end
+    
+    cg_axi_aw.sample();
+  end
+endfunction : convert_to_aw
+
+function void kb_fwd_eng_coverage::convert_to_ar(kb_axi4_vendor_txn_t txn);
+  if (txn.Direction == DENALI_CDN_AXI_DIRECTION_READ) begin
+    ar.valid = 1'b1;
+    ar.addr  = txn.StartAddress;
+    ar.len   = txn.Alen;
+    ar.size  = txn.Size - 1;
+    ar.id    = txn.IdTag;
+    
+    ar.user = '0;
+    foreach (txn.Auser[i]) begin
+      ar.user[(i * 32) +: 32] = txn.Auser[i];
+    end
+    
+    cg_axi_ar.sample();
+  end
+endfunction : convert_to_ar
+
+function void kb_fwd_eng_coverage::convert_to_w(kb_axi4_vendor_txn_t txn);
+  if (txn.Direction == DENALI_CDN_AXI_DIRECTION_WRITE) begin
+    w.valid = 1'b1;
+    w.last  = txn.Last;
+    w.data  = '0;
+    w.strb  = {txn.Strobe[127:0]};
+    w.user  = '0;
+    
+    foreach (txn.PhysicalData[i]) begin
+      w.data[(i * 32) +: 32] = txn.PhysicalData[i];
+    end
+    foreach (txn.User[i]) begin
+      w.user[(i * 32) +: 32] = txn.User[i];
+    end
+    
+    cg_axi_w.sample();
+  end
+endfunction : convert_to_w
+
+function void kb_fwd_eng_coverage::convert_to_b(kb_axi4_vendor_txn_t txn);
+  if (txn.Direction == DENALI_CDN_AXI_DIRECTION_WRITE) begin
+    b.valid = 1'b1;
+    b.id    = txn.IdTag;
+    b.resp  = txn.Resp - 1; // Denali encoding is AMBA response + 1[cite: 2]
+    
+    b.user = '0;
+    foreach (txn.Buser[i]) begin
+      b.user[(i * 32) +: 32] = txn.Buser[i];
+    end
+    
+    cg_axi_b.sample();
+  end
+endfunction : convert_to_b
+
+function void kb_fwd_eng_coverage::convert_to_r(kb_axi4_vendor_txn_t txn);
+  if (txn.Direction == DENALI_CDN_AXI_DIRECTION_READ) begin
+    r.valid = 1'b1;
+    r.id    = txn.IdTag;
+    r.resp  = txn.Resp - 1; // Denali encoding is AMBA response + 1[cite: 2]
+    r.last  = txn.Last;
+    
+    r.user  = '0;
+    r.data  = '0;
+    foreach (txn.PhysicalData[i]) begin
+      r.data[(i * 32) +: 32] = txn.PhysicalData[i];
+    end
+    foreach (txn.User[i]) begin
+      r.user[(i * 32) +: 32] = txn.User[i];
+    end
+    
+    cg_axi_r.sample();
+  end
+endfunction : convert_to_r
+
 
 function void kb_fwd_eng_coverage::report_phase(uvm_phase phase);
   super.report_phase(phase);
