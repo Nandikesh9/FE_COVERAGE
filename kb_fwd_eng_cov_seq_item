@@ -1,0 +1,20 @@
+`ifndef KB_FWD_ENG_COV_SEQ_ITEM_SV
+`define KB_FWD_ENG_COV_SEQ_ITEM_SV
+
+
+class kb_fwd_eng_cov_seq_item extends uvm_sequence_item;
+
+  `uvm_object_utils_begin(kb_fwd_eng_cov_seq_item)
+    `uvm_field_int(err_resp_type,                     UVM_ALL_ON)
+  `uvm_object_utils_end
+
+  bit [1:0] err_resp_type;
+
+  function new(string name = "kb_fwd_eng_cov_seq_item");
+    super.new(name);
+  endfunction : new
+
+endclass : kb_fwd_eng_cov_seq_item
+
+`endif // KB_FWD_ENG_COV_SEQ_ITEM_SV
+
