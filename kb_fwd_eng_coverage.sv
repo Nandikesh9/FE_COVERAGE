@@ -1,3 +1,6 @@
+`ifndef KB_FWD_ENG_COVERAGE_SV
+`define KB_FWD_ENG_COVERAGE_SV
+
 import kb_cxl_pkg::*;
 
 
@@ -5,6 +8,10 @@ class kb_fwd_eng_coverage extends uvm_component;
 
   `uvm_component_utils(kb_fwd_eng_coverage)
 
+  // analysis_fifo to get the internal variables from Scoreboard to Coverage
+  uvm_tlm_analysis_fifo #(kb_fwd_eng_seq_cov_item) cov_fifo;
+
+  // APB, CXL vip analysis fifo's
   uvm_tlm_analysis_fifo #(denaliCdn_apbTransaction) apb_fifo;
   uvm_tlm_analysis_fifo #(kb_cxl_m2s_snap) cxl_m2s_bus_fifo;
   uvm_tlm_analysis_fifo #(kb_cxl_s2m_snap) cxl_s2m_bus_fifo;
@@ -69,6 +76,60 @@ class kb_fwd_eng_coverage extends uvm_component;
   axi_b_src_t b;
   axi_r1024_src_t r;
 
+  // -------------------------------------------------------------------------
+  // Local Array Variables for CXL Channels 
+  // -------------------------------------------------------------------------
+  
+  // -------------------------------------------------------------------------
+  // Local Array Variables for CXL REQ Channels
+  // Sized for 4 lanes in the default 256 B flit mode  
+  // -------------------------------------------------------------------------
+  
+  bit [3:0]  req_valid;
+  bit [45:0] req_hpa[4];        // Host Physical Address corresponding to bits [51:6]
+  bit [3:0]  req_ld_id[4];      // Logical Device ID mapped from header bits [77:74]
+  bit [3:0]  req_opcode[4];     // Request Opcode (expected: MemRd 4'b0001)
+  bit [2:0]  req_snp_type[4];   // Snoop Type (expected: No-Op 3'b000)
+  bit [1:0]  req_meta_field[4]; // Metadata operation (expected: No-Op 2'b11)
+  bit [1:0]  req_meta_value[4]; // Metadata value (reserved when metaField is No-Op)
+  bit [15:0] req_tag[4];        // CXL transaction tag
+  bit        req_seen_valid[4]; // Previous valid Req observed per lane
+  bit [1:0]  req_gap_cycles[4]; // Saturates at 2 (two or more idle cycles)
+
+  
+  // 2 RwD Channels
+  bit [1:0]  rwd_valid;
+  bit [45:0] rwd_hpa[2];
+  bit [3:0]  rwd_ld_id[2];
+  bit [3:0]  rwd_opcode[2];
+  bit [2:0]  rwd_snp_type[2];
+  bit [1:0]  rwd_meta_field[2];
+  bit [1:0]  rwd_meta_value[2];
+  bit        rwd_poison[2];
+  bit [15:0] rwd_tag[2];
+  bit [511:0] rwd_data[2];
+  bit [63:0] byte_enable[2];
+  bit        rwd_seen_valid[2];
+  int unsigned rwd_gap_cycles[2];
+  
+  // 6 NDR Channels
+  bit [3:0]  ndr_ld_id[6];
+  bit [2:0]  ndr_opcode[6];
+  bit [1:0]  ndr_meta_field[6];
+  bit [1:0]  ndr_meta_value[6];
+  bit [15:0] ndr_tag[6];
+  bit [1:0]  ndr_dev_load[6];
+  
+  // 2 DRC/DRS Channels
+  bit [3:0]  drc_ld_id[2];
+  bit [2:0]  drc_opcode[2];
+  bit        drc_poison[2];
+  bit [1:0]  drc_meta_field[2];
+  bit [1:0]  drc_meta_value[2];
+  bit [15:0] drc_tag[2];
+  bit [1:0]  drc_dev_load[2];
+  bit [511:0] drc_data[2];
+
 
   // This component currently observes FE inputs only: APB configuration and
   // CXL M2S traffic. Internal error_response_type and FE outputs are checked
@@ -123,73 +184,97 @@ class kb_fwd_eng_coverage extends uvm_component;
   // REQ input coverage
   // -------------------------------------------------------------------------
   covergroup cg_req_packet with function sample(
-    input int unsigned lane,
+    input bit [3:0]    lane,
+    input bit          req_valid,
     input bit          flit_mode,
     input bit [3:0]    opcode,
     input bit [2:0]    snp_type,
     input bit [1:0]    meta_field,
+    input bit [1:0]    meta_value,
     input bit [15:0]   tag,
     input bit [45:0]   hpa,
     input bit [3:0]    ld_id,
     input bit          opcode_check_enable,
-    input bit          field_check_enable
+    input bit          field_check_enable,
+    input bit          gap_available,
+    input int unsigned gap_class,
+    input bit [3:0]    req_valid_p
   );
     option.per_instance = 1;
 
-    cp_flit_mode: coverpoint flit_mode {
+    cp_flit_mode: coverpoint flit_mode iff (req_valid) {
+      bins mode_256b_to_68b = (1'b1 => 1'b0);
+      bins mode_68b_to_256b = (1'b0 => 1'b1);
       bins mode_68b  = {1'b0};
       bins mode_256b = {1'b1};
     }
 
-    cp_ld_id: coverpoint ld_id { 
+    cp_valid: coverpoint req_valid iff (req_valid){
+      bins valid_1 = {1'b1};
+      bins valid_0 = {1'b0};
+    }
+
+    cp_fe_valid_gap: coverpoint gap_class iff (gap_available) {
+      bins back_to_back = {0}; // no invalid cycle between valid requests
+      bins gap_1cyc     = {1}; // one invalid cycle between valid requests
+      bins random_gap   = {2}; // two or more invalid cycles
+    }
+
+    cp_ld_id: coverpoint ld_id iff (req_valid) { 
       bins supported = {4'h0};
       bins unsupported = default;
     }
 
-    cp_lane: coverpoint lane {
-      bins lane_0 = {0};
-      bins lane_1 = {1};
-      bins lane_2 = {2};
-      bins lane_3 = {3};
-    }
+    cp_lane: coverpoint req_valid_p iff (lane==1'b0);
+    
+    cp_req_concurency: coverpoint $countones(req_valid_p);
+   // { 
+   //   bins no_valid_lane = {0};
+   //   bins one_lane      = {1};
+   //   bins two_lanes     = {2};
+   //   bins three_lanes   = {3};
+   //   bins four_lanes    = {4};
+   // }
 
-    cp_opcode: coverpoint opcode {
+    cp_opcode: coverpoint opcode iff (req_valid) {
       bins supported   = {4'h1};
       bins unsupported = default;
     }
 
-    cp_snp_type: coverpoint snp_type {
+    cp_snp_type: coverpoint snp_type iff (req_valid) {
       bins supported   = {3'b000};
       bins unsupported = default;
     }
 
-    cp_meta_field: coverpoint meta_field {
+    cp_meta_field: coverpoint meta_field iff (req_valid) {
       bins supported   = {2'b11};
       bins unsupported = default;
     }
 
-    cp_tag: coverpoint tag {
+    cp_meta_value: coverpoint meta_value iff (req_valid);
+
+    cp_tag: coverpoint tag iff (req_valid) {
        bins tags[8]  = {[16'h0000:16'hFFFF]};
     }
 
     // HPA is represented as HPA[51:6]. Bit 0 therefore identifies whether the
     // 64B line is aligned to the lower or upper half of a 128B boundary.
-    cp_hpa_alignment: coverpoint hpa[0] {
+    cp_hpa_alignment: coverpoint hpa[0] iff (req_valid) {
       bins aligned_128b     = {1'b0};
       bins upper_64b_half   = {1'b1};
     }
 
-    cp_opcode_check_enable: coverpoint opcode_check_enable {
+    cp_opcode_check_enable: coverpoint opcode_check_enable iff (req_valid) {
       bins disabled = {1'b0};
       bins enabled  = {1'b1};
     }
 
-    cp_field_check_enable: coverpoint field_check_enable {
+    cp_field_check_enable: coverpoint field_check_enable iff (req_valid) {
       bins disabled = {1'b0};
       bins enabled  = {1'b1};
     }
 
-    cr_lane_by_flit_mode: cross cp_flit_mode, cp_lane {
+    cr_lane_by_flit_mode: cross cp_flit_mode, cp_lane iff (req_valid) {
       illegal_bins mode_68b_upper_lanes =
         binsof(cp_flit_mode) intersect {1'b0} &&
         binsof(cp_lane) intersect {[2:3]};
@@ -199,105 +284,136 @@ class kb_fwd_eng_coverage extends uvm_component;
     //cr_snp_stimulus:    cross cp_snp_type, cp_field_check_enable;
     //cr_meta_stimulus:   cross cp_meta_field, cp_field_check_enable;
 
-    cr_lane_opcode:     cross cp_lane, cp_opcode, cp_opcode_check_enable;
-    cr_lane_snp_type:   cross cp_lane, cp_snp_type, cp_field_check_enable;
-    cr_lane_meta_field: cross cp_lane, cp_meta_field, cp_field_check_enable;
+    cr_lane_opcode:     cross cp_lane, cp_opcode, cp_opcode_check_enable iff (req_valid);
+    cr_lane_snp_type:   cross cp_lane, cp_snp_type, cp_field_check_enable iff (req_valid);
+    cr_lane_meta_field: cross cp_lane, cp_meta_field, cp_field_check_enable iff (req_valid);
     //cr_lane_meta_value: cross cp_lane, cp_meta_value, cp_field_check_enable;
     //cr_lane_ld_id:      cross cp_lane, cp_ld_id;
 
     // Exercises simultaneous supported/unsupported field combinations without
     // assuming the value of an unobservable internal error signal.
-    cr_header_fields: cross cp_opcode, cp_snp_type, cp_meta_field;
+    cr_header_fields: cross cp_opcode, cp_snp_type, cp_meta_field iff (req_valid);
   endgroup : cg_req_packet
 
   // -------------------------------------------------------------------------
   // RWD input coverage
   // -------------------------------------------------------------------------
   covergroup cg_rwd_packet with function sample(
-    input int unsigned lane,
+    input bit [1:0]    lane,
+    input bit          rwd_valid,
     input bit          flit_mode,
     input bit [3:0]    opcode,
     input bit [2:0]    snp_type,
     input bit [1:0]    meta_field,
+    input bit [1:0]    meta_value,
     input bit [15:0]   tag,
     input bit [45:0]   hpa,
     input bit [3:0]    ld_id,
     input bit          poison,
+    input bit [511:0]  rwd_data,
+    input bit [63:0]   byte_enable,
     input bit          opcode_check_enable,
     input bit          field_check_enable,
-    input bit          poison_check_enable
+    input bit          poison_check_enable,
+    input bit [1:0]    rwd_valid_p
   );
     option.per_instance = 1;
 
-    cp_flit_mode: coverpoint flit_mode {
+    cp_valid: coverpoint rwd_valid { 
+      bins valid_low = {1'b0};
+      bins valid_high = {1'b1};
+    }
+
+    cp_flit_mode: coverpoint flit_mode iff(rwd_valid){
       bins mode_68b  = {1'b0};
       bins mode_256b = {1'b1};
     }
 
-    cp_lane: coverpoint lane {
-      bins lane_0 = {0};
-      bins lane_1 = {1};
-    }
+    cp_lane: coverpoint lane iff(lane==1'b0);
+    //{
+    //  bins lane_0 = {0};
+    //  bins lane_1 = {1};
+    //}
+    
+    cp_rwd_concurency: coverpoint $countones(rwd_valid_p);
+   // { 
+   //   bins no_valid_lane = {0};
+   //   bins one_lane      = {1};
+   //   bins two_lanes     = {2};
+   // }
 
-    cp_ld_id: coverpoint ld_id { 
+    cp_ld_id: coverpoint ld_id iff(rwd_valid) { 
       bins supported = {4'h1};
       bins unsupported = default;
     }
 
-    cp_opcode: coverpoint opcode {
+    cp_opcode: coverpoint opcode iff(rwd_valid) {
       bins supported   = {4'h1};
       bins unsupported = default;
     }
 
-    cp_snp_type: coverpoint snp_type {
+    cp_snp_type: coverpoint snp_type iff(rwd_valid) {
       bins supported   = {3'b000};
       bins unsupported = default;
     }
 
-    cp_meta_field: coverpoint meta_field {
+    cp_meta_field: coverpoint meta_field iff(rwd_valid) {
       bins supported   = {2'b11};
       bins unsupported = default;
     }
 
-    cp_tag: coverpoint tag {
+    cp_tag: coverpoint tag iff(rwd_valid) {
       bins tags[8]  = {[16'h0000:16'hFFFF]};
 
     }
 
-    cp_hpa_alignment: coverpoint hpa[0] {
+    cp_hpa_alignment: coverpoint hpa[0] iff(rwd_valid) {
       bins aligned_128b   = {1'b0};
       bins upper_64b_half = {1'b1};
     }
 
-    cp_poison: coverpoint poison {
+    cp_poison: coverpoint poison iff(rwd_valid) {
       bins clear = {1'b0};
       bins set   = {1'b1};
     }
 
-    cp_opcode_check_enable: coverpoint opcode_check_enable {
+    cp_opcode_check_enable: coverpoint opcode_check_enable iff(rwd_valid) {
       bins disabled = {1'b0};
       bins enabled  = {1'b1};
     }
 
-    cp_field_check_enable: coverpoint field_check_enable {
+    cp_field_check_enable: coverpoint field_check_enable iff(rwd_valid) {
       bins disabled = {1'b0};
       bins enabled  = {1'b1};
     }
 
-    cp_poison_check_enable: coverpoint poison_check_enable {
+    cp_poison_check_enable: coverpoint poison_check_enable iff(rwd_valid) {
       bins disabled = {1'b0};
       bins enabled  = {1'b1};
     }
 
-    cp_poison_enable: coverpoint poison_enable { 
+    cp_poison_enable: coverpoint poison_enable iff(rwd_valid) { 
       bins poison_enb = {1'b1};
       bins poison_dis_enb = {1'b0};
     }
 
-    cr_lane_by_flit_mode: cross cp_flit_mode, cp_lane {
+    cr_lane_by_flit_mode: cross cp_flit_mode, cp_lane iff(rwd_valid) {
       illegal_bins mode_68b_upper_lane =
         binsof(cp_flit_mode) intersect {1'b0} &&
         binsof(cp_lane) intersect {1};
+    }
+
+    cp_rwd_data: coverpoint rwd_data iff(rwd_valid) {
+      bins all_zeros = {'0};
+      bins all_ones  = {'1};
+      bins others    = default;
+    }
+
+    // Byte Enable Coverpoint
+    cp_byte_enable: coverpoint byte_enable iff(rwd_valid) {
+      bins full_be   = {64'hFFFF_FFFF_FFFF_FFFF};
+      bins empty_be  = {64'h0000_0000_0000_0000};
+      bins partial   = default;
     }
 
     //cr_opcode_stimulus: cross cp_opcode, cp_opcode_check_enable;
@@ -305,15 +421,15 @@ class kb_fwd_eng_coverage extends uvm_component;
     //cr_meta_stimulus:   cross cp_meta_field, cp_field_check_enable;
     //cr_poison_stimulus: cross cp_poison, cp_poison_check_enable, cp_poison_enable;
 
-    cr_lane_opcode:     cross cp_lane, cp_opcode, cp_opcode_check_enable;
-    cr_lane_snp_type:   cross cp_lane, cp_snp_type, cp_field_check_enable;
-    cr_lane_meta_field: cross cp_lane, cp_meta_field, cp_field_check_enable;
-    cr_lane_ld_id:      cross cp_lane, cp_ld_id;
-    cr_lane_poison:     cross cp_lane, cp_poison, cp_poison_check_enable;
+    cr_lane_opcode:     cross cp_lane, cp_opcode, cp_opcode_check_enable iff(rwd_valid);
+    cr_lane_snp_type:   cross cp_lane, cp_snp_type, cp_field_check_enable iff(rwd_valid);
+    cr_lane_meta_field: cross cp_lane, cp_meta_field, cp_field_check_enable iff(rwd_valid);
+    cr_lane_ld_id:      cross cp_lane, cp_ld_id iff(rwd_valid);
+    cr_lane_poison:     cross cp_lane, cp_poison, cp_poison_check_enable iff(rwd_valid);
 
     // Poison, unsupported opcode and unsupported fields are independent parser
     // detections, so cover their simultaneous input combinations.
-    cr_error_inputs: cross cp_opcode, cp_snp_type, cp_meta_field, cp_poison;
+    cr_error_inputs: cross cp_opcode, cp_snp_type, cp_meta_field, cp_poison iff(rwd_valid);
   endgroup : cg_rwd_packet
 
   // -------------------------------------------------------------------------
@@ -817,9 +933,20 @@ class kb_fwd_eng_coverage extends uvm_component;
   // -------------------------------------------------------------------------
   covergroup cg_axi_aw;
     option.per_instance = 1;
-    cp_id   : coverpoint aw.id { bins ids[4] = {[0:3]}; } // Tag FIFOs map to IDs 0-3[cite: 6]
-    cp_len  : coverpoint aw.len { bins single_beat = {0}; } // CXL FE transactions are single beat[cite: 6]
+    cp_id   : coverpoint aw.id { bins ids[4] = {[0:3]}; } // Tag FIFOs map to IDs 0-3
+    cp_len  : coverpoint aw.len { bins single_beat = {0}; } // CXL FE transactions are single beat
     cp_size : coverpoint aw.size { bins size_64b = {6}; bins size_128b = {7}; } // 64B encoding
+    cp_aw_user : coverpoint aw.user { bins user_0 = {'h0};
+                                      bins user_7 = {'h80};
+                                      illegal_bins others = default; }
+
+    cp_poison_check_0: coverpoint rwd_poison[0];
+    cp_poison_check_1: coverpoint rwd_poison[1] iff (flit_mode_inst == 1'b1);
+
+    // Cross
+    cr_id_size : cross cp_id, cp_size;
+    cr_id_poison_0 : cross cp_id, cp_aw_user, poison_crc_invert_enable_inst, cp_poison_check_0;
+    cr_id_poison_1 : cross cp_id, cp_aw_user, poison_crc_invert_enable_inst, cp_poison_check_1 iff (flit_mode_inst == 1'b1);
   endgroup
 
   covergroup cg_axi_ar;
@@ -927,6 +1054,11 @@ function void kb_fwd_eng_coverage::reset_config_shadow();
   unsupported_opcode_check_enable_inst = 1'b1;
   unsupported_field_check_enable_inst  = 1'b1;
   poison_crc_invert_enable_inst        = 1'b1;
+
+  foreach (req_seen_valid[i]) begin
+    req_seen_valid[i] = 1'b0;
+    req_gap_cycles[i] = 0;
+  end
 endfunction : reset_config_shadow
 
 task kb_fwd_eng_coverage::run_phase(uvm_phase phase);
@@ -1040,23 +1172,74 @@ function void kb_fwd_eng_coverage::sample_req_inputs(
 );
   int unsigned max_req_lanes;
 
+  // rst_n is active low. Discard partial gap history while reset is asserted.
+  if (!snap.rst_n) begin
+    foreach (req_seen_valid[i]) begin
+      req_seen_valid[i] = 1'b0;
+      req_gap_cycles[i] = 0;
+    end
+    return;
+  end
+
   max_req_lanes = flit_mode_inst ? 4 : 2;
 
-  for (int i = 0; i < KB_CXL_MAX_NUM_REQ; i++) begin
+  for (int i = 0; i < max_req_lanes; i++) begin
+    bit gap_available;
+    int unsigned gap_class;
+    int unsigned req_concurrency = 0;
+
+    gap_available = 1'b0;
+    gap_class = 0;
+
     if (snap.req_items[i].valid) begin
-      cg_req_packet.sample(
-        i,
-        flit_mode_inst,
-        snap.req_items[i].opcode,
-        snap.req_items[i].snp_type,
-        snap.req_items[i].meta_field,
-        snap.req_items[i].tag,
-        snap.req_items[i].hpa,
-        snap.req_items[i].ld_id,
-        unsupported_opcode_check_enable_inst,
-        unsupported_field_check_enable_inst
-      );
+      gap_available = req_seen_valid[i];
+      gap_class = req_gap_cycles[i];
+      req_concurrency++;
+
+      // 1. Populate the local arrays for the active lane
+      
+      req_valid[i]      = snap.req_items[i].valid;
+      req_opcode[i]     = snap.req_items[i].opcode;
+      req_snp_type[i]   = snap.req_items[i].snp_type;
+      req_meta_field[i] = snap.req_items[i].meta_field;
+      req_meta_value[i] = snap.req_items[i].meta_value;
+      req_tag[i]        = snap.req_items[i].tag;
+      req_hpa[i]        = snap.req_items[i].hpa;
+      req_ld_id[i]      = snap.req_items[i].ld_id;
+
+      req_seen_valid[i] = 1'b1;
+      req_gap_cycles[i] = 0;
+    end else if (req_seen_valid[i] && req_gap_cycles[i] < 2) begin
+      // This function is called for each CXL snapshot, so invalid snapshots
+      // between requests accumulate the per-lane gap.
+      req_gap_cycles[i]++;
     end
+
+    // Sample every active lane each cycle so cp_valid sees both values.
+    // Packet coverpoints/crosses are gated by req_valid inside the covergroup.
+    cg_req_packet.sample(
+      i,
+      req_valid[i],
+      flit_mode_inst,
+      req_opcode[i],
+      req_snp_type[i],
+      req_meta_field[i],
+      req_meta_value[i],
+      req_tag[i],
+      req_hpa[i],
+      req_ld_id[i],
+      unsupported_opcode_check_enable_inst,
+      unsupported_field_check_enable_inst,
+      gap_available,
+      gap_class,
+      req_valid
+    );
+  end
+
+  // Lanes 2 and 3 are inactive in 68B mode; don't carry history across modes.
+  for (int i = max_req_lanes; i < KB_CXL_MAX_NUM_REQ; i++) begin
+    req_seen_valid[i] = 1'b0;
+    req_gap_cycles[i] = 0;
   end
 
   // Sample each adjacent pair that can be presented in the active flit mode.
@@ -1067,9 +1250,15 @@ function void kb_fwd_eng_coverage::sample_req_inputs(
 
     pair_present = snap.req_items[i].valid &&
                    snap.req_items[i+1].valid;
-    aligned      = !snap.req_items[i].hpa[0];
-    contiguous   = snap.req_items[i+1].hpa ==
-                   (snap.req_items[i].hpa + 1'b1);
+                   
+    // Evaluate alignment and contiguity using the local arrays when both are valid
+    if (pair_present) begin
+      aligned    = !req_hpa[i][0];
+      contiguous = (req_hpa[i+1] == (req_hpa[i] + 1'b1));
+    end else begin
+      aligned    = 1'b0;
+      contiguous = 1'b0;
+    end
 
     if (snap.req_items[i].valid || snap.req_items[i+1].valid) begin
       cg_combining.sample(
@@ -1088,23 +1277,65 @@ function void kb_fwd_eng_coverage::sample_rwd_inputs(
 );
   int unsigned max_rwd_lanes;
 
+  // rst_n is active low. Discard partial gap history while reset is asserted.
+  if (!snap.rst_n) begin
+    foreach (req_seen_valid[i]) begin
+      rwd_seen_valid[i] = 1'b0;
+      rwd_gap_cycles[i] = 0;
+    end
+    return;
+  end
+
   max_rwd_lanes = flit_mode_inst ? 2 : 1;
 
   for (int i = 0; i < KB_CXL_MAX_NUM_RWD; i++) begin
+
+    bit rwd_gap_available;
+    int unsigned rwd_gap_class;
+    int unsigned rwd_concurrency = 0;
+
+    rwd_gap_available = 1'b0;
+    rwd_gap_class = 0;
+
     if (snap.rwd_items[i].valid) begin
+      rwd_gap_available = rwd_seen_valid[i];
+      rwd_gap_class = rwd_gap_cycles[i];
+      rwd_concurrency++;
+      // 1. Populate the local arrays for the active lane
+      rwd_valid[i]      = snap.rwd_items[i].valid;
+      rwd_opcode[i]     = snap.rwd_items[i].opcode;
+      rwd_snp_type[i]   = snap.rwd_items[i].snp_type;
+      rwd_meta_field[i] = snap.rwd_items[i].meta_field;
+      rwd_meta_value[i] = snap.rwd_items[i].meta_value;
+      rwd_tag[i]        = snap.rwd_items[i].tag;
+      rwd_hpa[i]        = snap.rwd_items[i].hpa;
+      rwd_ld_id[i]      = snap.rwd_items[i].ld_id;
+      rwd_poison[i]     = snap.rwd_items[i].poison;
+      
+      // Note: rwd_data and byte_enable are populated here for completeness, 
+      // even if cg_rwd_packet does not currently sample them.
+      rwd_data[i]       = snap.rwd_items[i].wdata;
+      byte_enable[i]    = snap.rwd_items[i].byte_enable;
+
+      // 2. Sample the covergroup using the local array variables
       cg_rwd_packet.sample(
         i,
+        rwd_valid[i],
         flit_mode_inst,
-        snap.rwd_items[i].opcode,
-        snap.rwd_items[i].snp_type,
-        snap.rwd_items[i].meta_field,
-        snap.rwd_items[i].tag,
-        snap.rwd_items[i].hpa,
-        snap.rwd_items[i].ld_id,
-        snap.rwd_items[i].poison,
+        rwd_opcode[i],
+        rwd_snp_type[i],
+        rwd_meta_field[i],
+        rwd_meta_value[i],
+        rwd_tag[i],
+        rwd_hpa[i],
+        rwd_ld_id[i],
+        rwd_poison[i],
+        rwd_data[i],
+        byte_enable[i],
         unsupported_opcode_check_enable_inst,
         unsupported_field_check_enable_inst,
-        poison_crc_invert_enable_inst
+        poison_crc_invert_enable_inst,
+        rwd_valid
       );
     end
   end
@@ -1116,9 +1347,15 @@ function void kb_fwd_eng_coverage::sample_rwd_inputs(
 
     pair_present = snap.rwd_items[0].valid &&
                    snap.rwd_items[1].valid;
-    aligned      = !snap.rwd_items[0].hpa[0];
-    contiguous   = snap.rwd_items[1].hpa ==
-                   (snap.rwd_items[0].hpa + 1'b1);
+                   
+    // Evaluate alignment and contiguity using the local arrays when both are valid
+    if (pair_present) begin
+      aligned    = !rwd_hpa[0][0];
+      contiguous = (rwd_hpa[1] == (rwd_hpa[0] + 1'b1));
+    end else begin
+      aligned    = 1'b0;
+      contiguous = 1'b0;
+    end
 
     if (snap.rwd_items[0].valid || snap.rwd_items[1].valid) begin
       cg_combining.sample(
@@ -1131,7 +1368,7 @@ function void kb_fwd_eng_coverage::sample_rwd_inputs(
     end
   end
 endfunction : sample_rwd_inputs
-
+/*
 function void kb_fwd_eng_coverage::sample_ndr_outputs(kb_cxl_s2m_snap snap);
   for (int i = 0; i < KB_CXL_MAX_NUM_NDR; i++) begin
     if (snap.ndr_items[i].valid) begin
@@ -1147,20 +1384,63 @@ function void kb_fwd_eng_coverage::sample_ndr_outputs(kb_cxl_s2m_snap snap);
     end
   end
 endfunction : sample_ndr_outputs
+*/
+function void kb_fwd_eng_coverage::sample_ndr_outputs(kb_cxl_s2m_snap snap);
+  int unsigned max_ndr_lanes;
+
+  // Set the active lane count based on the current flit mode
+  max_ndr_lanes = flit_mode_inst ? KB_CXL_MAX_NUM_NDR : 2; // MAX_NUM = 6
+
+  for (int i = 0; i < max_ndr_lanes; i++) begin
+    if (snap.ndr_items[i].valid) begin
+      // 1. Populate the local arrays for the active NDR lane
+      ndr_opcode[i]     = snap.ndr_items[i].s2m_ndr_opcode;
+      ndr_meta_field[i] = snap.ndr_items[i].s2m_meta_field;
+      ndr_meta_value[i] = snap.ndr_items[i].s2m_meta_value;
+      ndr_tag[i]        = snap.ndr_items[i].s2m_tag;
+      ndr_ld_id[i]      = snap.ndr_items[i].s2m_ld_id;
+      ndr_dev_load[i]   = snap.ndr_items[i].s2m_dev_load;
+
+      // 2. Sample the covergroup using the local array variables
+      cg_s2m_ndr_packet.sample(
+        i,
+        ndr_opcode[i],
+        ndr_meta_field[i],
+        ndr_meta_value[i],
+        ndr_tag[i],
+        ndr_ld_id[i],
+        ndr_dev_load[i]
+      );
+    end
+  end
+endfunction : sample_ndr_outputs
+
 
 function void kb_fwd_eng_coverage::sample_drc_outputs(kb_cxl_s2m_snap snap);
   for (int i = 0; i < KB_CXL_MAX_NUM_DRC; i++) begin
     if (snap.drc_items[i].valid) begin
+      // 1. Populate the local arrays for the active DRC lane
+      drc_opcode[i]     = snap.drc_items[i].s2m_drc_opcode;
+      drc_meta_field[i] = snap.drc_items[i].s2m_meta_field;
+      drc_meta_value[i] = snap.drc_items[i].s2m_meta_value;
+      drc_tag[i]        = snap.drc_items[i].s2m_tag;
+      drc_poison[i]     = snap.drc_items[i].s2m_poison;
+      drc_ld_id[i]      = snap.drc_items[i].s2m_ld_id;
+      drc_dev_load[i]   = snap.drc_items[i].s2m_dev_load;
+      drc_data[i]       = snap.drc_items[i].s2m_data;
+
+      // 2. Sample the covergroup using the local array variables, 
+      // explicitly passing the lane index 'i' as the first argument[cite: 2]
       cg_s2m_drc_packet.sample(
         i,
-        snap.drc_items[i].s2m_drc_opcode,
-        snap.drc_items[i].s2m_meta_field,
-        snap.drc_items[i].s2m_meta_value,
-        snap.drc_items[i].s2m_tag,
-        snap.drc_items[i].s2m_poison,
-        snap.drc_items[i].s2m_ld_id,
-        snap.drc_items[i].s2m_dev_load,
-        snap.drc_items[i].s2m_data
+        drc_opcode[i],
+        drc_meta_field[i],
+        drc_meta_value[i],
+        drc_tag[i],
+        drc_poison[i],
+        drc_ld_id[i],
+        drc_dev_load[i],
+        drc_data[i]
       );
     end
   end
@@ -1370,5 +1650,6 @@ function void kb_fwd_eng_coverage::report_phase(uvm_phase phase);
 endfunction : report_phase
 
 `endif // KB_FWD_ENG_COVERAGE_SV
+
 
 
