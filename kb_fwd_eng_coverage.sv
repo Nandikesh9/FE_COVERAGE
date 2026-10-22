@@ -1,3 +1,7 @@
+//TODO'S
+// -> write either ignore or illegal bins for Ex-OKAY, Decode Error
+//
+
 `ifndef KB_FWD_ENG_COVERAGE_SV
 `define KB_FWD_ENG_COVERAGE_SV
 
@@ -8,8 +12,12 @@ class kb_fwd_eng_coverage extends uvm_component;
 
   `uvm_component_utils(kb_fwd_eng_coverage)
 
+  // Shared environment configuration provides the generated RAL model used
+  // to observe the live credit-manager debug counters.
+  kb_fwd_eng_env_cfg h_env_cfg;
+
   // analysis_fifo to get the internal variables from Scoreboard to Coverage
-  uvm_tlm_analysis_fifo #(kb_fwd_eng_seq_cov_item) cov_fifo;
+  uvm_tlm_analysis_fifo #(kb_fwd_eng_cov_seq_item) cov_fifo;
 
   // APB, CXL vip analysis fifo's
   uvm_tlm_analysis_fifo #(denaliCdn_apbTransaction) apb_fifo;
@@ -103,7 +111,7 @@ class kb_fwd_eng_coverage extends uvm_component;
   bit [3:0]  rwd_ld_id[2];
   bit [3:0]  rwd_opcode[2];
   bit [2:0]  rwd_snp_type[2];
-  bit [1:0]  rwd_meta_field[2];
+  bit [2:0]  rwd_meta_field[2];
   bit [1:0]  rwd_meta_value[2];
   bit        rwd_poison[2];
   bit [15:0] rwd_tag[2];
@@ -153,12 +161,18 @@ class kb_fwd_eng_coverage extends uvm_component;
 
   bit reset_seen;
 
+  // Credit-manager FSM state encodings used by cg_fe_credit_manager.
+  // Egress: 0=IDLE, 1=INIT, 2=RUN, 3=DEINIT_MST, 4=DEINIT_SLV.
+  // Ingress: 0=IDLE, 1=INIT, 2=RUN, 3=DEINIT.
+  bit [2:0] credit_egress_state;
+  bit [2:0] credit_ingress_state;
+
   // HDM Decoder APB Storage Arrays (10 instances, 24-bit registers)
   bit [23:0] reg_hpa_base[10];
   bit [23:0] reg_hpa_top[10];
   bit [23:0] reg_dpa_base[10];
 
-  // Tracker variables to allow unified sampling in cg_apb_config
+  // Tracker variables to allow unified sampling in cg_fe_apb_registers
   bit        is_hdm_update;
   int        current_hdm_idx;
   bit [23:0] current_hpa_base;
@@ -178,12 +192,14 @@ class kb_fwd_eng_coverage extends uvm_component;
   bit         rd_reset_token;
 
   // Tracker variable for fe_error_status register (18 active bits)
-  bit [17:0] fe_error_status_inst;
+  bit [19:0] fe_error_status_inst;
+  bit [19:0] fe_error_status_prev;
+  bit        fe_error_status_prev_valid;
 
   // -------------------------------------------------------------------------
   // REQ input coverage
   // -------------------------------------------------------------------------
-  covergroup cg_req_packet with function sample(
+  covergroup cg_fe_cxl_parser_req with function sample(
     input bit [3:0]    lane,
     input bit          req_valid,
     input bit          flit_mode,
@@ -202,17 +218,17 @@ class kb_fwd_eng_coverage extends uvm_component;
   );
     option.per_instance = 1;
 
-    cp_flit_mode: coverpoint flit_mode iff (req_valid) {
+    cp_fe_flit_mode: coverpoint flit_mode iff (req_valid) {
       bins mode_256b_to_68b = (1'b1 => 1'b0);
       bins mode_68b_to_256b = (1'b0 => 1'b1);
       bins mode_68b  = {1'b0};
       bins mode_256b = {1'b1};
     }
 
-    cp_valid: coverpoint req_valid iff (req_valid){
-      bins valid_1 = {1'b1};
-      bins valid_0 = {1'b0};
-    }
+    //cp_fe_valid: coverpoint req_valid iff (req_valid){
+    //  bins valid_1 = {1'b1};
+    //  bins valid_0 = {1'b0};
+    //}
 
     cp_fe_valid_gap: coverpoint gap_class iff (gap_available) {
       bins back_to_back = {0}; // no invalid cycle between valid requests
@@ -220,14 +236,14 @@ class kb_fwd_eng_coverage extends uvm_component;
       bins random_gap   = {2}; // two or more invalid cycles
     }
 
-    cp_ld_id: coverpoint ld_id iff (req_valid) { 
+    cp_fe_ld_id: coverpoint ld_id iff (req_valid) { 
       bins supported = {4'h0};
       bins unsupported = default;
     }
 
-    cp_lane: coverpoint req_valid_p iff (lane==1'b0);
+    cp_fe_req_channel: coverpoint req_valid_p iff (lane==1'b0);
     
-    cp_req_concurency: coverpoint $countones(req_valid_p);
+    cp_fe_req_concurrency: coverpoint $countones(req_valid_p);
    // { 
    //   bins no_valid_lane = {0};
    //   bins one_lane      = {1};
@@ -236,69 +252,69 @@ class kb_fwd_eng_coverage extends uvm_component;
    //   bins four_lanes    = {4};
    // }
 
-    cp_opcode: coverpoint opcode iff (req_valid) {
+    cp_fe_unsup_req_opcode: coverpoint opcode iff (req_valid) {
       bins supported   = {4'h1};
       bins unsupported = default;
     }
 
-    cp_snp_type: coverpoint snp_type iff (req_valid) {
+    cp_fe_snp_type: coverpoint snp_type iff (req_valid) {
       bins supported   = {3'b000};
       bins unsupported = default;
     }
 
-    cp_meta_field: coverpoint meta_field iff (req_valid) {
+    cp_fe_meta_field: coverpoint meta_field iff (req_valid) {
       bins supported   = {2'b11};
       bins unsupported = default;
     }
 
-    cp_meta_value: coverpoint meta_value iff (req_valid);
+    cp_fe_meta_value: coverpoint meta_value iff (req_valid);
 
-    cp_tag: coverpoint tag iff (req_valid) {
+    cp_fe_tag: coverpoint tag iff (req_valid) {
        bins tags[8]  = {[16'h0000:16'hFFFF]};
     }
 
     // HPA is represented as HPA[51:6]. Bit 0 therefore identifies whether the
     // 64B line is aligned to the lower or upper half of a 128B boundary.
-    cp_hpa_alignment: coverpoint hpa[0] iff (req_valid) {
+    cp_fe_hpa_alignment: coverpoint hpa[0] iff (req_valid) {
       bins aligned_128b     = {1'b0};
       bins upper_64b_half   = {1'b1};
     }
 
-    cp_opcode_check_enable: coverpoint opcode_check_enable iff (req_valid) {
+    cp_fe_valid_unsupported_req_opcode_enable: coverpoint opcode_check_enable iff (req_valid) {
       bins disabled = {1'b0};
       bins enabled  = {1'b1};
     }
 
-    cp_field_check_enable: coverpoint field_check_enable iff (req_valid) {
+    cp_fe_unsupported_req_filed_chk_enables: coverpoint field_check_enable iff (req_valid) {
       bins disabled = {1'b0};
       bins enabled  = {1'b1};
     }
 
-    cr_lane_by_flit_mode: cross cp_flit_mode, cp_lane iff (req_valid) {
+    cr_fe_lane_by_flit_mode: cross cp_fe_flit_mode, cp_fe_req_channel iff (req_valid) {
       illegal_bins mode_68b_upper_lanes =
-        binsof(cp_flit_mode) intersect {1'b0} &&
-        binsof(cp_lane) intersect {[2:3]};
+        binsof(cp_fe_flit_mode) intersect {1'b0} &&
+        binsof(cp_fe_req_channel) intersect {[2:3]};
     }
 
-    //cr_opcode_stimulus: cross cp_opcode, cp_opcode_check_enable;
-    //cr_snp_stimulus:    cross cp_snp_type, cp_field_check_enable;
-    //cr_meta_stimulus:   cross cp_meta_field, cp_field_check_enable;
+    //cr_fe_opcode_stimulus: cross cp_fe_unsup_req_opcode, cp_fe_valid_unsupported_req_opcode_enable;
+    //cr_fe_snp_stimulus:    cross cp_fe_snp_type, cp_fe_unsupported_req_filed_chk_enables;
+    //cr_fe_meta_stimulus:   cross cp_fe_meta_field, cp_fe_unsupported_req_filed_chk_enables;
 
-    cr_lane_opcode:     cross cp_lane, cp_opcode, cp_opcode_check_enable iff (req_valid);
-    cr_lane_snp_type:   cross cp_lane, cp_snp_type, cp_field_check_enable iff (req_valid);
-    cr_lane_meta_field: cross cp_lane, cp_meta_field, cp_field_check_enable iff (req_valid);
-    //cr_lane_meta_value: cross cp_lane, cp_meta_value, cp_field_check_enable;
-    //cr_lane_ld_id:      cross cp_lane, cp_ld_id;
+    cr_fe_unsup_req_x_en_by_channel:     cross cp_fe_req_channel, cp_fe_unsup_req_opcode, cp_fe_valid_unsupported_req_opcode_enable iff (req_valid);
+    cr_fe_lane_snp_type:   cross cp_fe_req_channel, cp_fe_snp_type, cp_fe_unsupported_req_filed_chk_enables iff (req_valid);
+    cr_fe_lane_meta_field: cross cp_fe_req_channel, cp_fe_meta_field, cp_fe_unsupported_req_filed_chk_enables iff (req_valid);
+    //cr_fe_lane_meta_value: cross cp_fe_req_channel, cp_fe_meta_value, cp_fe_unsupported_req_filed_chk_enables;
+    //cr_fe_lane_ld_id:      cross cp_fe_req_channel, cp_fe_ld_id;
 
     // Exercises simultaneous supported/unsupported field combinations without
     // assuming the value of an unobservable internal error signal.
-    cr_header_fields: cross cp_opcode, cp_snp_type, cp_meta_field iff (req_valid);
-  endgroup : cg_req_packet
+    cr_fe_header_fields: cross cp_fe_unsup_req_opcode, cp_fe_snp_type, cp_fe_meta_field iff (req_valid);
+  endgroup : cg_fe_cxl_parser_req
 
   // -------------------------------------------------------------------------
   // RWD input coverage
   // -------------------------------------------------------------------------
-  covergroup cg_rwd_packet with function sample(
+  covergroup cg_fe_cxl_parser_rwd with function sample(
     input bit [1:0]    lane,
     input bit          rwd_valid,
     input bit          flit_mode,
@@ -319,124 +335,124 @@ class kb_fwd_eng_coverage extends uvm_component;
   );
     option.per_instance = 1;
 
-    cp_valid: coverpoint rwd_valid { 
+    cp_fe_valid: coverpoint rwd_valid { 
       bins valid_low = {1'b0};
       bins valid_high = {1'b1};
     }
 
-    cp_flit_mode: coverpoint flit_mode iff(rwd_valid){
+    cp_fe_flit_mode: coverpoint flit_mode iff(rwd_valid){
       bins mode_68b  = {1'b0};
       bins mode_256b = {1'b1};
     }
 
-    cp_lane: coverpoint lane iff(lane==1'b0);
+    cp_fe_rwd_channel: coverpoint rwd_valid_p iff(lane==1'b0);
     //{
     //  bins lane_0 = {0};
     //  bins lane_1 = {1};
     //}
     
-    cp_rwd_concurency: coverpoint $countones(rwd_valid_p);
+    cp_fe_rwd_concurrency: coverpoint $countones(rwd_valid_p);
    // { 
    //   bins no_valid_lane = {0};
    //   bins one_lane      = {1};
    //   bins two_lanes     = {2};
    // }
 
-    cp_ld_id: coverpoint ld_id iff(rwd_valid) { 
+    cp_fe_ld_id: coverpoint ld_id iff(rwd_valid) { 
       bins supported = {4'h1};
       bins unsupported = default;
     }
 
-    cp_opcode: coverpoint opcode iff(rwd_valid) {
+    cp_fe_unsup_rwd_field_opcode: coverpoint opcode iff(rwd_valid) {
       bins supported   = {4'h1};
       bins unsupported = default;
     }
 
-    cp_snp_type: coverpoint snp_type iff(rwd_valid) {
+    cp_fe_unsup_rwd_field_snp_type: coverpoint snp_type iff(rwd_valid) {
       bins supported   = {3'b000};
       bins unsupported = default;
     }
 
-    cp_meta_field: coverpoint meta_field iff(rwd_valid) {
+    cp_fe_unsup_rwd_field_meta_field: coverpoint meta_field iff(rwd_valid) {
       bins supported   = {2'b11};
       bins unsupported = default;
     }
 
-    cp_tag: coverpoint tag iff(rwd_valid) {
+    cp_fe_tag: coverpoint tag iff(rwd_valid) {
       bins tags[8]  = {[16'h0000:16'hFFFF]};
 
     }
 
-    cp_hpa_alignment: coverpoint hpa[0] iff(rwd_valid) {
+    cp_fe_hpa_alignment: coverpoint hpa[0] iff(rwd_valid) {
       bins aligned_128b   = {1'b0};
       bins upper_64b_half = {1'b1};
     }
 
-    cp_poison: coverpoint poison iff(rwd_valid) {
+    cp_fe_poison_received: coverpoint poison iff(rwd_valid) {
       bins clear = {1'b0};
       bins set   = {1'b1};
     }
 
-    cp_opcode_check_enable: coverpoint opcode_check_enable iff(rwd_valid) {
+    cp_fe_unsupported_rwd_opcode_enable: coverpoint opcode_check_enable iff(rwd_valid) {
       bins disabled = {1'b0};
       bins enabled  = {1'b1};
     }
 
-    cp_field_check_enable: coverpoint field_check_enable iff(rwd_valid) {
+    cp_fe_unsupported_rwd_filed_chk_enables: coverpoint field_check_enable iff(rwd_valid) {
       bins disabled = {1'b0};
       bins enabled  = {1'b1};
     }
 
-    cp_poison_check_enable: coverpoint poison_check_enable iff(rwd_valid) {
+    cp_fe_crc_invert_enable: coverpoint poison_check_enable iff(rwd_valid) {
       bins disabled = {1'b0};
       bins enabled  = {1'b1};
     }
 
-    cp_poison_enable: coverpoint poison_enable iff(rwd_valid) { 
+    cp_fe_poison_enable: coverpoint poison_enable iff(rwd_valid) { 
       bins poison_enb = {1'b1};
       bins poison_dis_enb = {1'b0};
     }
 
-    cr_lane_by_flit_mode: cross cp_flit_mode, cp_lane iff(rwd_valid) {
+    cr_fe_lane_by_flit_mode: cross cp_fe_flit_mode, cp_fe_rwd_channel iff(rwd_valid) {
       illegal_bins mode_68b_upper_lane =
-        binsof(cp_flit_mode) intersect {1'b0} &&
-        binsof(cp_lane) intersect {1};
+        binsof(cp_fe_flit_mode) intersect {1'b0} &&
+        binsof(cp_fe_rwd_channel) intersect {1};
     }
 
-    cp_rwd_data: coverpoint rwd_data iff(rwd_valid) {
+    cp_fe_rwd_data: coverpoint rwd_data iff(rwd_valid) {
       bins all_zeros = {'0};
       bins all_ones  = {'1};
       bins others    = default;
     }
 
     // Byte Enable Coverpoint
-    cp_byte_enable: coverpoint byte_enable iff(rwd_valid) {
+    cp_fe_byte_enable: coverpoint byte_enable iff(rwd_valid) {
       bins full_be   = {64'hFFFF_FFFF_FFFF_FFFF};
       bins empty_be  = {64'h0000_0000_0000_0000};
       bins partial   = default;
     }
 
-    //cr_opcode_stimulus: cross cp_opcode, cp_opcode_check_enable;
-    //cr_snp_stimulus:    cross cp_snp_type, cp_field_check_enable;
-    //cr_meta_stimulus:   cross cp_meta_field, cp_field_check_enable;
-    //cr_poison_stimulus: cross cp_poison, cp_poison_check_enable, cp_poison_enable;
+    //cr_fe_opcode_stimulus: cross cp_fe_unsup_rwd_field_opcode, cp_fe_unsupported_rwd_opcode_enable;
+    //cr_fe_snp_stimulus:    cross cp_fe_unsup_rwd_field_snp_type, cp_fe_unsupported_rwd_filed_chk_enables;
+    //cr_fe_meta_stimulus:   cross cp_fe_unsup_rwd_field_meta_field, cp_fe_unsupported_rwd_filed_chk_enables;
+    //cr_fe_poison_stimulus: cross cp_fe_poison_received, cp_fe_crc_invert_enable, cp_fe_poison_enable;
 
-    cr_lane_opcode:     cross cp_lane, cp_opcode, cp_opcode_check_enable iff(rwd_valid);
-    cr_lane_snp_type:   cross cp_lane, cp_snp_type, cp_field_check_enable iff(rwd_valid);
-    cr_lane_meta_field: cross cp_lane, cp_meta_field, cp_field_check_enable iff(rwd_valid);
-    cr_lane_ld_id:      cross cp_lane, cp_ld_id iff(rwd_valid);
-    cr_lane_poison:     cross cp_lane, cp_poison, cp_poison_check_enable iff(rwd_valid);
+    cr_fe_unsup_rwd_x_en_opcode_by_channel:     cross cp_fe_rwd_channel, cp_fe_unsup_rwd_field_opcode, cp_fe_unsupported_rwd_opcode_enable iff(rwd_valid);
+    cr_fe_unsup_rwd_x_en_snp_type_by_channel:   cross cp_fe_rwd_channel, cp_fe_unsup_rwd_field_snp_type, cp_fe_unsupported_rwd_filed_chk_enables iff(rwd_valid);
+    cr_fe_unsup_rwd_x_en_meta_field_by_channel: cross cp_fe_rwd_channel, cp_fe_unsup_rwd_field_meta_field, cp_fe_unsupported_rwd_filed_chk_enables iff(rwd_valid);
+    cr_fe_lane_ld_id:      cross cp_fe_rwd_channel, cp_fe_ld_id iff(rwd_valid);
+    cr_fe_poison_x_crcinv_by_channel:     cross cp_fe_rwd_channel, cp_fe_poison_received, cp_fe_crc_invert_enable iff(rwd_valid);
 
     // Poison, unsupported opcode and unsupported fields are independent parser
     // detections, so cover their simultaneous input combinations.
-    cr_error_inputs: cross cp_opcode, cp_snp_type, cp_meta_field, cp_poison iff(rwd_valid);
-  endgroup : cg_rwd_packet
+    cr_fe_error_inputs: cross cp_fe_unsup_rwd_field_opcode, cp_fe_unsup_rwd_field_snp_type, cp_fe_unsup_rwd_field_meta_field, cp_fe_poison_received iff(rwd_valid);
+  endgroup : cg_fe_cxl_parser_rwd
 
   // -------------------------------------------------------------------------
   // S2M DRC (Data Response) output coverage
   // Exposes 2 DRC channels
   // -------------------------------------------------------------------------
-  covergroup cg_s2m_drc_packet with function sample(
+  covergroup cg_fe_cxl_encap_drs with function sample(
     input int unsigned lane,
     input bit [2:0]    opcode,
     input bit [1:0]    meta_field,
@@ -450,53 +466,53 @@ class kb_fwd_eng_coverage extends uvm_component;
     option.per_instance = 1;
 
     // DRC interface has 2 active channels
-    cp_lane: coverpoint lane {
+    cp_fe_lane: coverpoint lane {
       bins lane_0 = {0};
       bins lane_1 = {1};
     }
 
     // Only MemData (000) and MemData-NXM (001) are used for DRS
-    cp_opcode: coverpoint opcode {
+    cp_fe_opcode: coverpoint opcode {
       bins memdata     = {3'b000};
       bins memdata_nxm = {3'b001};
       bins unsupported = default;
     }
 
     // MetaField and MetaValue are always 0
-    cp_meta_field: coverpoint meta_field {
+    cp_fe_meta_field: coverpoint meta_field {
       bins expected_0  = {2'b00};
       bins unsupported = default;
     }
     
-    cp_meta_value: coverpoint meta_value {
+    cp_fe_meta_value: coverpoint meta_value {
       bins expected_0  = {2'b00};
       bins unsupported = default;
     }
 
     // ld_id is always 0 for single LD device
-    cp_ld_id: coverpoint ld_id {
+    cp_fe_ld_id: coverpoint ld_id {
       bins expected_0  = {4'h0};
       bins unsupported = default;
     }
 
-    cp_poison: coverpoint poison {
+    cp_fe_poison: coverpoint poison {
       bins clear = {1'b0};
       bins set   = {1'b1};
     }
 
-    cp_poison_enable: coverpoint poison_enable { 
+    cp_fe_poison_enable: coverpoint poison_enable { 
       bins poison_enb = {1'b1};
       bins poison_dis_enb = {1'b0};
     }
 
     // DevLoad comes from egress queue fill level
-    cp_dev_load: coverpoint dev_load;
+    cp_fe_dev_load: coverpoint dev_load;
 
-    cp_tag: coverpoint tag {
+    cp_fe_tag: coverpoint tag {
       bins tags[8] = {[16'h0000:16'hFFFF]};
     }
 
-    cp_s2m_data : coverpoint s2m_data {
+    cp_fe_s2m_data : coverpoint s2m_data {
     bins all_zeros = {'0};
     bins all_ones  = {'1};
     bins other     = default;
@@ -504,20 +520,20 @@ class kb_fwd_eng_coverage extends uvm_component;
 
     // MemData can be poisoned or clear; MemData-NXM is typically unpoisoned but 
     // depends on "Poison On Decode Error Enable".
-    cr_opcode_poison: cross cp_opcode, cp_poison;
+    cr_fe_opcode_poison: cross cp_fe_opcode, cp_fe_poison;
 
-    cr_lane_opcode: cross cp_lane, cp_opcode;
-    cr_lane_meta: cross cp_lane, cp_meta_field, cp_meta_value;
-    cr_lane_poison: cross cp_lane, cp_poison_enable, cp_poison;
-    cr_lane_dev_load: cross cp_lane, cp_dev_load;
+    cr_fe_lane_opcode: cross cp_fe_lane, cp_fe_opcode;
+    cr_fe_lane_meta: cross cp_fe_lane, cp_fe_meta_field, cp_fe_meta_value;
+    cr_fe_lane_poison: cross cp_fe_lane, cp_fe_poison_enable, cp_fe_poison;
+    cr_fe_lane_dev_load: cross cp_fe_lane, cp_fe_dev_load;
     
-  endgroup : cg_s2m_drc_packet
+  endgroup : cg_fe_cxl_encap_drs
 
   // -------------------------------------------------------------------------
   // S2M NDR (No Data Response) output coverage
   // Exposes 6 NDR channels
   // -------------------------------------------------------------------------
-  covergroup cg_s2m_ndr_packet with function sample(
+  covergroup cg_fe_cxl_encap_ndr with function sample(
     input int unsigned lane,
     input bit [2:0]    opcode,
     input bit [1:0]    meta_field,
@@ -529,142 +545,235 @@ class kb_fwd_eng_coverage extends uvm_component;
     option.per_instance = 1;
 
     // NDR interface has 6 active channels
-    cp_lane: coverpoint lane {
+    cp_fe_lane: coverpoint lane {
       bins lanes[] = {[0:5]};
     }
 
     // NDR Opcode is always Cmp (000) for HDM-H
-    cp_opcode: coverpoint opcode {
+    cp_fe_opcode: coverpoint opcode {
       bins cmp         = {3'b000};
       bins unsupported = default;
     }
 
     // MetaField and MetaValue are always 0
-    cp_meta_field: coverpoint meta_field {
+    cp_fe_meta_field: coverpoint meta_field {
       bins expected_0  = {2'b00};
       bins unsupported = default;
     }
     
-    cp_meta_value: coverpoint meta_value {
+    cp_fe_meta_value: coverpoint meta_value {
       bins expected_0  = {2'b00};
       bins unsupported = default;
     }
 
     // ld_id is always 0 for single LD device
-    cp_ld_id: coverpoint ld_id {
+    cp_fe_ld_id: coverpoint ld_id {
       bins expected_0  = {4'h0};
       bins unsupported = default;
     }
 
     // DevLoad comes from egress queue fill level
-    cp_dev_load: coverpoint dev_load;
+    cp_fe_dev_load: coverpoint dev_load;
 
-    cp_tag: coverpoint tag {
+    cp_fe_tag: coverpoint tag {
       bins tags[8] = {[16'h0000:16'hFFFF]};
     }
 
     // Cross combinations to ensure no rogue bits appear alongside expected Cmp opcode
-    cr_ndr_fields: cross cp_opcode, cp_meta_field, cp_ld_id;
+    cr_fe_ndr_fields: cross cp_fe_opcode, cp_fe_meta_field, cp_fe_ld_id;
 
-    cr_lane_opcode: cross cp_opcode, cp_lane;
-    cr_lane_meta: cross cp_lane, cp_meta_field, cp_meta_value;
-    cr_ld_id: cross cp_lane, cp_ld_id;
-    cr_dev_load: cross cp_lane, cp_dev_load;
+    cr_fe_lane_opcode: cross cp_fe_opcode, cp_fe_lane;
+    cr_fe_lane_meta: cross cp_fe_lane, cp_fe_meta_field, cp_fe_meta_value;
+    cr_fe_ld_id: cross cp_fe_lane, cp_fe_ld_id;
+    cr_fe_dev_load: cross cp_fe_lane, cp_fe_dev_load;
 
-  endgroup : cg_s2m_ndr_packet
+  endgroup : cg_fe_cxl_encap_ndr
 
   // -------------------------------------------------------------------------
   // Combining-eligibility input coverage
   // -------------------------------------------------------------------------
-  covergroup cg_combining with function sample(
+  covergroup cg_fe_cxl_parser_combining with function sample(
     input bit path_is_write,
-    input bit combining_enable,
+    input bit combining_rd_enable,
+    input bit combining_wr_enable,
+    input bit [2:0] pair_id,
     input bit adjacent_pair_present,
     input bit first_hpa_128b_aligned,
     input bit addresses_contiguous
   );
     option.per_instance = 1;
 
-    cp_path: coverpoint path_is_write {
+    cp_fe_combine_direction: coverpoint path_is_write {
       bins read  = {1'b0};
       bins write = {1'b1};
     }
 
-    cp_enable: coverpoint combining_enable {
+    cp_fe_combine_rd_enable: coverpoint combining_rd_enable {
       bins disabled = {1'b0};
       bins enabled  = {1'b1};
     }
 
-    cp_pair_present: coverpoint adjacent_pair_present {
+    cp_fe_combine_wr_enable: coverpoint combining_wr_enable {
+      bins disabled = {1'b0};
+      bins enabled  = {1'b1};
+    }
+
+    // pair_id encoding:
+    //   0 = Req lanes 0-1, 1 = Req lanes 1-2, 2 = Req lanes 2-3,
+    //   3 = RwD lanes 0-1.
+    // A pair is combinable only when both lanes are valid in the same sample,
+    // the first address is 128 B aligned, and the second address is base+64 B.
+    cp_fe_combine_valid_pair: coverpoint pair_id iff (
+      adjacent_pair_present &&
+      first_hpa_128b_aligned &&
+      addresses_contiguous
+    ) {
+      bins req_0_1 = {3'd0};
+      bins req_1_2 = {3'd1};
+      bins req_2_3 = {3'd2};
+      bins req_3_0 = {3'd3};
+      bins rwd_0_1 = {3'd4};
+      bins rwd_1_0 = {3'd5};
+    }
+
+    cp_fe_combine_pair_present: coverpoint adjacent_pair_present {
       bins incomplete_pair = {1'b0};
       bins complete_pair   = {1'b1};
     }
 
-    cp_alignment: coverpoint first_hpa_128b_aligned {
+    cp_fe_combine_alignment: coverpoint first_hpa_128b_aligned {
       bins unaligned = {1'b0};
       bins aligned   = {1'b1};
     }
 
-    cp_contiguous: coverpoint addresses_contiguous {
+    cp_fe_combine_contiguous: coverpoint addresses_contiguous {
       bins noncontiguous = {1'b0};
       bins contiguous    = {1'b1};
     }
 
-    cr_combining_inputs: cross
-      cp_path,
-      cp_enable,
-      cp_pair_present,
-      cp_alignment,
-      cp_contiguous;
-  endgroup : cg_combining
+    // Violations that are unambiguously observable from a complete adjacent
+    // pair in the current CXL snapshot.
+    cp_fe_combine_violation: coverpoint {
+      !addresses_contiguous,
+      !first_hpa_128b_aligned
+    } iff (adjacent_pair_present) {
+      bins addr_ne_base_plus_64b   = {2'b10};
+      bins base_not_128b_aligned   = {2'b01};
+      bins multi_violation         = {2'b11};
+      ignore_bins no_violation     = {2'b00};
+    }
+
+    // The pair type fixes the architectural direction: Req is read and RwD
+    // is write. Ignore the impossible pair/direction combinations.
+    cr_fe_combine_dir: cross cp_fe_combine_valid_pair,
+                             cp_fe_combine_direction {
+      ignore_bins req_as_write =
+        binsof(cp_fe_combine_valid_pair) intersect {[3'd0:3'd2]} &&
+        binsof(cp_fe_combine_direction) intersect {1'b1};
+      ignore_bins rwd_as_read =
+        binsof(cp_fe_combine_valid_pair) intersect {3'd3} &&
+        binsof(cp_fe_combine_direction) intersect {1'b0};
+    }
+
+    // Required independent-control cases. Both-enabled and both-disabled are
+    // already covered by the individual enable coverpoints.
+    cr_fe_combine_rd_wr_indep: cross cp_fe_combine_rd_enable,
+                                     cp_fe_combine_wr_enable {
+      bins rd_only =
+        binsof(cp_fe_combine_rd_enable) intersect {1'b1} &&
+        binsof(cp_fe_combine_wr_enable) intersect {1'b0};
+      bins wr_only =
+        binsof(cp_fe_combine_rd_enable) intersect {1'b0} &&
+        binsof(cp_fe_combine_wr_enable) intersect {1'b1};
+     ignore_bins coupled_settings = 
+        !binsof(cp_fe_combine_rd_enable) intersect {1'b1} && !binsof(cp_fe_combine_wr_enable) intersect {1'b0} ||
+        (binsof(cp_fe_combine_rd_enable) intersect {1'b0} && binsof(cp_fe_combine_wr_enable) intersect {1'b0}) ||
+        (binsof(cp_fe_combine_rd_enable) intersect {1'b1} && binsof(cp_fe_combine_wr_enable) intersect {1'b1});
+    }
+
+    cr_fe_combining_inputs: cross
+      cp_fe_combine_direction,
+      //cp_fe_combine_enable,
+      cp_fe_combine_pair_present,
+      cp_fe_combine_alignment,
+      cp_fe_combine_contiguous;
+  endgroup : cg_fe_cxl_parser_combining
+
+  //--------------------------------------------------------------------------
+  // TAG_FIFO'S CoverGroup
+  //--------------------------------------------------------------------------
+
+ covergroup cg_fe_tag_fifo with function sample(
+  input bit          is_write,
+  input int unsigned axi_id
+);
+  option.per_instance = 1;
+
+  cp_fe_tagfifo_arid: coverpoint axi_id
+    iff (!is_write) {
+    bins rd_fifo0 = {0};
+    bins rd_fifo1 = {1};
+    bins rd_fifo2 = {2};
+    bins rd_fifo3 = {3};
+  }
+
+  cp_fe_tagfifo_awid: coverpoint axi_id
+    iff (is_write) {
+    bins wr_fifo0 = {0};
+    bins wr_fifo1 = {1};
+    bins wr_fifo2 = {2};
+    bins wr_fifo3 = {3};
+  }
+
+endgroup : cg_fe_tag_fifo 
 
   // -------------------------------------------------------------------------
   // APB configuration coverage
   // -------------------------------------------------------------------------
-  covergroup cg_apb_config;
+  covergroup cg_fe_apb_registers;
     option.per_instance = 1;
 
-    cp_flit_mode: coverpoint flit_mode_inst {
+    cp_fe_flit_mode: coverpoint flit_mode_inst {
       bins mode_68b  = {1'b0};
       bins mode_256b = {1'b1};
     }
 
-    cp_combining_rd_enable: coverpoint combining_rd_enable_inst {
+    cp_fe_combining_rd_enable: coverpoint combining_rd_enable_inst {
       bins disabled = {1'b0};
       bins enabled  = {1'b1};
     }
 
-    cp_combining_wr_enable: coverpoint combining_wr_enable_inst {
+    cp_fe_combining_wr_enable: coverpoint combining_wr_enable_inst {
       bins disabled = {1'b0};
       bins enabled  = {1'b1};
     }
 
-    cp_opcode_check_enable: coverpoint unsupported_opcode_check_enable_inst {
+    cp_fe_shared_opcode_check_enable: coverpoint unsupported_opcode_check_enable_inst {
       bins disabled = {1'b0};
       bins enabled  = {1'b1};
     }
 
-    cp_field_check_enable: coverpoint unsupported_field_check_enable_inst {
+    cp_fe_shared_field_check_enable: coverpoint unsupported_field_check_enable_inst {
       bins disabled = {1'b0};
       bins enabled  = {1'b1};
     }
 
-    cp_poison_check_enable: coverpoint poison_crc_invert_enable_inst {
+    cp_fe_crc_invert_enable: coverpoint poison_crc_invert_enable_inst {
       bins disabled = {1'b0};
       bins enabled  = {1'b1};
     }
 
-    cp_mem_app_pending: coverpoint mem_app_pending_enable {
+    cp_fe_mem_app_pending: coverpoint mem_app_pending_enable {
       bins disabled = {1'b0};
       bins enabled  = {1'b1};
     }
 
-    cp_nxm_enable: coverpoint nxm_enable {
+    cp_fe_nxm_enable: coverpoint nxm_enable {
       bins disabled = {1'b0};
       bins enabled  = {1'b1};
     }
 
-    cp_poison_enable: coverpoint poison_enable {
+    cp_fe_poison_enable: coverpoint poison_enable {
       bins disabled = {1'b0};
       bins enabled  = {1'b1};
     }
@@ -672,21 +781,21 @@ class kb_fwd_eng_coverage extends uvm_component;
     // -------------------------------------------------------------------------
     // HDM Decoder Coverpoints (Conditioned on is_hdm_update)
     // -------------------------------------------------------------------------
-    cp_hdm_idx: coverpoint current_hdm_idx iff (is_hdm_update) {
+    cp_fe_hdm_idx: coverpoint current_hdm_idx iff (is_hdm_update) {
       bins decoders[] = {[0:9]};
     }
 
-    cp_hdm_hpa_base: coverpoint current_hpa_base iff (is_hdm_update) {
+    cp_fe_hdm_hpa_base: coverpoint current_hpa_base iff (is_hdm_update) {
       //bins unconfigured = {24'h0};
       bins configured[12]   = {[24'h0:24'hFF_FFFF]};
     }
     
-    cp_hdm_hpa_top: coverpoint current_hpa_top iff (is_hdm_update) {
+    cp_fe_hdm_hpa_top: coverpoint current_hpa_top iff (is_hdm_update) {
       //bins unconfigured = {24'h0};
       bins configured[12]   = {[24'h0:24'hFF_FFFF]};
     }
     
-    cp_hdm_dpa_base: coverpoint current_dpa_base iff (is_hdm_update) {
+    cp_fe_hdm_dpa_base: coverpoint current_dpa_base iff (is_hdm_update) {
       //bins unconfigured = {24'h0};
       bins configured[12]   = {[24'h0:24'hFF_FFFF]};
     }
@@ -694,43 +803,43 @@ class kb_fwd_eng_coverage extends uvm_component;
     // -------------------------------------------------------------------------
     // Interrupt Enables Coverpoints
     // -------------------------------------------------------------------------
-    cp_hdm_miss_rd      : coverpoint interrupt_enables_inst[0]  { bins disabled = {0}; bins enabled = {1}; }
-    cp_hdm_miss_wr      : coverpoint interrupt_enables_inst[1]  { bins disabled = {0}; bins enabled = {1}; }
-    cp_perm_err_rd      : coverpoint interrupt_enables_inst[2]  { bins disabled = {0}; bins enabled = {1}; }
-    cp_perm_err_wr      : coverpoint interrupt_enables_inst[3]  { bins disabled = {0}; bins enabled = {1}; }
-    cp_tag_range_rd     : coverpoint interrupt_enables_inst[4]  { bins disabled = {0}; bins enabled = {1}; }
-    cp_tag_range_wr     : coverpoint interrupt_enables_inst[5]  { bins disabled = {0}; bins enabled = {1}; }
-    cp_unsupported_req  : coverpoint interrupt_enables_inst[6]  { bins disabled = {0}; bins enabled = {1}; }
-    cp_unsupported_rwd  : coverpoint interrupt_enables_inst[7]  { bins disabled = {0}; bins enabled = {1}; }
-    cp_poison_recv      : coverpoint interrupt_enables_inst[8]  { bins disabled = {0}; bins enabled = {1}; }
-    cp_parity_rd_err    : coverpoint interrupt_enables_inst[9]  { bins disabled = {0}; bins enabled = {1}; }
-    cp_parity_wr_err    : coverpoint interrupt_enables_inst[10] { bins disabled = {0}; bins enabled = {1}; }
-    cp_parity_rd_chk    : coverpoint interrupt_enables_inst[11] { bins disabled = {0}; bins enabled = {1}; }
-    cp_parity_wr_chk    : coverpoint interrupt_enables_inst[12] { bins disabled = {0}; bins enabled = {1}; }
-    cp_egress_rd_thresh : coverpoint interrupt_enables_inst[13] { bins disabled = {0}; bins enabled = {1}; }
-    cp_egress_wr_thresh : coverpoint interrupt_enables_inst[14] { bins disabled = {0}; bins enabled = {1}; }
-    cp_ndr_credit_ovf   : coverpoint interrupt_enables_inst[15] { bins disabled = {0}; bins enabled = {1}; }
-    cp_drs_credit_ovf   : coverpoint interrupt_enables_inst[16] { bins disabled = {0}; bins enabled = {1}; }
-    cp_dcd_ded          : coverpoint interrupt_enables_inst[17] { bins disabled = {0}; bins enabled = {1}; }
-    cp_irq_global_en    : coverpoint interrupt_enables_inst[18] { bins disabled = {0}; bins enabled = {1}; }
+    cp_fe_hdm_miss_rd      : coverpoint interrupt_enables_inst[0]  { bins disabled = {0}; bins enabled = {1}; }
+    cp_fe_hdm_miss_wr      : coverpoint interrupt_enables_inst[1]  { bins disabled = {0}; bins enabled = {1}; }
+    cp_fe_perm_err_rd      : coverpoint interrupt_enables_inst[2]  { bins disabled = {0}; bins enabled = {1}; }
+    cp_fe_perm_err_wr      : coverpoint interrupt_enables_inst[3]  { bins disabled = {0}; bins enabled = {1}; }
+    cp_fe_tag_range_rd     : coverpoint interrupt_enables_inst[4]  { bins disabled = {0}; bins enabled = {1}; }
+    cp_fe_tag_range_wr     : coverpoint interrupt_enables_inst[5]  { bins disabled = {0}; bins enabled = {1}; }
+    cp_fe_unsupported_req  : coverpoint interrupt_enables_inst[6]  { bins disabled = {0}; bins enabled = {1}; }
+    cp_fe_unsupported_rwd  : coverpoint interrupt_enables_inst[7]  { bins disabled = {0}; bins enabled = {1}; }
+    cp_fe_poison_recv      : coverpoint interrupt_enables_inst[8]  { bins disabled = {0}; bins enabled = {1}; }
+    cp_fe_parity_rd_err    : coverpoint interrupt_enables_inst[9]  { bins disabled = {0}; bins enabled = {1}; }
+    cp_fe_parity_wr_err    : coverpoint interrupt_enables_inst[10] { bins disabled = {0}; bins enabled = {1}; }
+    cp_fe_parity_rd_chk    : coverpoint interrupt_enables_inst[11] { bins disabled = {0}; bins enabled = {1}; }
+    cp_fe_parity_wr_chk    : coverpoint interrupt_enables_inst[12] { bins disabled = {0}; bins enabled = {1}; }
+    cp_fe_egress_rd_thresh : coverpoint interrupt_enables_inst[13] { bins disabled = {0}; bins enabled = {1}; }
+    cp_fe_egress_wr_thresh : coverpoint interrupt_enables_inst[14] { bins disabled = {0}; bins enabled = {1}; }
+    cp_fe_ndr_credit_ovf   : coverpoint interrupt_enables_inst[15] { bins disabled = {0}; bins enabled = {1}; }
+    cp_fe_drs_credit_ovf   : coverpoint interrupt_enables_inst[16] { bins disabled = {0}; bins enabled = {1}; }
+    cp_fe_dcd_ded          : coverpoint interrupt_enables_inst[17] { bins disabled = {0}; bins enabled = {1}; }
+    cp_fe_irq_global_en    : coverpoint interrupt_enables_inst[18] { bins disabled = {0}; bins enabled = {1}; }
 
     // -------------------------------------------------------------------------
     // WR_Token Bucket / WR_Rate Limiter Coverpoints
     // Address 'h80a00
     // -------------------------------------------------------------------------
-    cp_wr_refill_period: coverpoint wr_refill_period {
+    cp_fe_wr_refill_period: coverpoint wr_refill_period {
       bins periods[4] = {[16'h0000:16'hFFFF]}; 
     }
 
-   cp_wr_capacity: coverpoint wr_capacity {
+   cp_fe_wr_capacity: coverpoint wr_capacity {
      bins capacities[4] = {[16'h0000:16'hFFFF]}; 
    }
 
-   cp_wr_refill_rate: coverpoint wr_refill_rate {
+   cp_fe_wr_refill_rate: coverpoint wr_refill_rate {
      bins rates[4] = {[5'h00:5'h1F]}; // 5-bit width
    }
 
-   cp_wr_reset_token: coverpoint wr_reset_token {
+   cp_fe_wr_reset_token: coverpoint wr_reset_token {
      bins deasserted = {1'b0};
      bins asserted   = {1'b1};
    }
@@ -739,19 +848,19 @@ class kb_fwd_eng_coverage extends uvm_component;
     // RD_Token Bucket / RD_Rate Limiter Coverpoints
     // Address 'h80a00
     // -------------------------------------------------------------------------
-    cp_rd_refill_period: coverpoint rd_refill_period {
+    cp_fe_rd_refill_period: coverpoint rd_refill_period {
       bins periods[4] = {[16'h0000:16'hFFFF]}; 
     }
 
-   cp_rd_capacity: coverpoint rd_capacity {
+   cp_fe_rd_capacity: coverpoint rd_capacity {
      bins capacities[4] = {[16'h0000:16'hFFFF]}; 
    }
 
-   cp_rd_refill_rate: coverpoint rd_refill_rate {
+   cp_fe_rd_refill_rate: coverpoint rd_refill_rate {
      bins rates[4] = {[5'h00:5'h1F]}; // 5-bit width
    }
 
-   cp_rd_reset_token: coverpoint rd_reset_token {
+   cp_fe_rd_reset_token: coverpoint rd_reset_token {
      bins deasserted = {1'b0};
      bins asserted   = {1'b1};
    }
@@ -759,234 +868,300 @@ class kb_fwd_eng_coverage extends uvm_component;
     // -------------------------------------------------------------------------
     // FE Error Status Register Coverpoints
     // -------------------------------------------------------------------------
-    cp_hdm_miss_rd_status      : coverpoint fe_error_status_inst[0]  { bins clean = {0}; bins error = {1}; }
-    cp_hdm_miss_wr_status      : coverpoint fe_error_status_inst[1]  { bins clean = {0}; bins error = {1}; }
-    cp_perm_error_rd_status    : coverpoint fe_error_status_inst[2]  { bins clean = {0}; bins error = {1}; }
-    cp_perm_error_wr_status    : coverpoint fe_error_status_inst[3]  { bins clean = {0}; bins error = {1}; }
-    cp_tag_range_rd_status     : coverpoint fe_error_status_inst[4]  { bins clean = {0}; bins error = {1}; }
-    cp_tag_range_wr_status     : coverpoint fe_error_status_inst[5]  { bins clean = {0}; bins error = {1}; }
-    cp_unsupported_req_status  : coverpoint fe_error_status_inst[6]  { bins clean = {0}; bins error = {1}; }
-    cp_unsupported_rwd_status  : coverpoint fe_error_status_inst[7]  { bins clean = {0}; bins error = {1}; }
-    cp_poison_received_status  : coverpoint fe_error_status_inst[8]  { bins clean = {0}; bins error = {1}; }
-    cp_parity_rd_err_status    : coverpoint fe_error_status_inst[9]  { bins clean = {0}; bins error = {1}; }
-    cp_parity_wr_err_status    : coverpoint fe_error_status_inst[10] { bins clean = {0}; bins error = {1}; }
-    cp_parity_rd_chk_status    : coverpoint fe_error_status_inst[11] { bins clean = {0}; bins error = {1}; }
-    cp_parity_wr_chk_status    : coverpoint fe_error_status_inst[12] { bins clean = {0}; bins error = {1}; }
-    cp_egress_rd_thresh_status : coverpoint fe_error_status_inst[13] { bins clean = {0}; bins error = {1}; }
-    cp_egress_wr_thresh_status : coverpoint fe_error_status_inst[14] { bins clean = {0}; bins error = {1}; }
-    cp_ndr_credit_ovf_status   : coverpoint fe_error_status_inst[15] { bins clean = {0}; bins error = {1}; }
-    cp_drs_credit_ovf_status   : coverpoint fe_error_status_inst[16] { bins clean = {0}; bins error = {1}; }
-    cp_dcd_ded_status          : coverpoint fe_error_status_inst[17] { bins clean = {0}; bins error = {1}; }
+    cp_fe_hdm_miss_rd_status      : coverpoint fe_error_status_inst[0]  { bins clean = {0}; bins error = {1}; }
+    cp_fe_hdm_miss_wr_status      : coverpoint fe_error_status_inst[1]  { bins clean = {0}; bins error = {1}; }
+    cp_fe_perm_error_rd_status    : coverpoint fe_error_status_inst[2]  { bins clean = {0}; bins error = {1}; }
+    cp_fe_perm_error_wr_status    : coverpoint fe_error_status_inst[3]  { bins clean = {0}; bins error = {1}; }
+    cp_fe_tag_range_rd_status     : coverpoint fe_error_status_inst[4]  { bins clean = {0}; bins error = {1}; }
+    cp_fe_tag_range_wr_status     : coverpoint fe_error_status_inst[5]  { bins clean = {0}; bins error = {1}; }
+    cp_fe_unsupported_req_status  : coverpoint fe_error_status_inst[6]  { bins clean = {0}; bins error = {1}; }
+    cp_fe_unsupported_rwd_status  : coverpoint fe_error_status_inst[7]  { bins clean = {0}; bins error = {1}; }
+    cp_fe_poison_received_status  : coverpoint fe_error_status_inst[8]  { bins clean = {0}; bins error = {1}; }
+    cp_fe_parity_rd_err_status    : coverpoint fe_error_status_inst[9]  { bins clean = {0}; bins error = {1}; }
+    cp_fe_parity_wr_err_status    : coverpoint fe_error_status_inst[10] { bins clean = {0}; bins error = {1}; }
+    cp_fe_parity_rd_chk_status    : coverpoint fe_error_status_inst[11] { bins clean = {0}; bins error = {1}; }
+    cp_fe_parity_wr_chk_status    : coverpoint fe_error_status_inst[12] { bins clean = {0}; bins error = {1}; }
+    cp_fe_egress_rd_thresh_status : coverpoint fe_error_status_inst[13] { bins clean = {0}; bins error = {1}; }
+    cp_fe_egress_wr_thresh_status : coverpoint fe_error_status_inst[14] { bins clean = {0}; bins error = {1}; }
+    cp_fe_ndr_credit_ovf_status   : coverpoint fe_error_status_inst[15] { bins clean = {0}; bins error = {1}; }
+    cp_fe_drs_credit_ovf_status   : coverpoint fe_error_status_inst[16] { bins clean = {0}; bins error = {1}; }
+    cp_fe_dcd_ded_status          : coverpoint fe_error_status_inst[17] { bins clean = {0}; bins error = {1}; }
 
 
     // Cross Coverage: Verify the reset token triggers across various capacities
-    cr_wr_capacity_reset: cross cp_wr_capacity, cp_wr_reset_token;
-    cr_rd_capacity_reset: cross cp_rd_capacity, cp_rd_reset_token;
+    cr_fe_wr_capacity_reset: cross cp_fe_wr_capacity, cp_fe_wr_reset_token;
+    cr_fe_rd_capacity_reset: cross cp_fe_rd_capacity, cp_fe_rd_reset_token;
 
-    // Cross the Global Enable against a subset of critical datapath errors
-    cr_global_mask_hdm_miss  : cross cp_irq_global_en, cp_hdm_miss_rd;
-    cr_global_mask_dcd_fatal : cross cp_irq_global_en, cp_dcd_ded;
-    cr_global_mask_ovf       : cross cp_irq_global_en, cp_ndr_credit_ovf;
+    cr_fe_parser_configuration: cross
+      cp_fe_flit_mode,
+      cp_fe_combining_rd_enable,
+      cp_fe_combining_wr_enable;
 
-    cr_parser_configuration: cross
-      cp_flit_mode,
-      cp_combining_rd_enable,
-      cp_combining_wr_enable;
-
-    cr_error_configuration: cross
-      cp_opcode_check_enable,
-      cp_field_check_enable,
-      cp_poison_check_enable;
+    cr_fe_error_configuration: cross
+      cp_fe_shared_opcode_check_enable,
+      cp_fe_shared_field_check_enable,
+      cp_fe_crc_invert_enable;
 
     // Cross the index with the base to ensure every individual decoder (0-9) gets a valid HPA configuration
-    cr_idx_hpa_base: cross cp_hdm_idx, cp_hdm_hpa_base;
-  endgroup : cg_apb_config
+    cr_fe_idx_hpa_base: cross cp_fe_hdm_idx, cp_fe_hdm_hpa_base;
+  endgroup : cg_fe_apb_registers
 
   // -------------------------------------------------------------------------
-  // Observable M2S link input coverage
+  // FE credit-manager coverage
   // -------------------------------------------------------------------------
-  covergroup cg_m2s_link with function sample(
-    input bit rst_n,
-    input bit mst_req,
-    input bit mst_ack
+  covergroup cg_fe_credit_manager with function sample(
+    input bit          fsm_sample_valid,
+    input bit [2:0]    egress_fsm_state,
+    input bit [2:0]    ingress_fsm_state,
+    input bit          credit_sample_valid,
+    input bit          credit_is_ingress,
+    input int unsigned credit_count,
+    input bit          overflow_sample_valid,
+    input bit [1:0]    credit_overflow_src,
+    input bit          credit_overflow_irq_en
   );
     option.per_instance = 1;
 
-    cp_reset: coverpoint rst_n {
-      bins asserted   = {1'b0};
-      bins deasserted = {1'b1};
-      bins assertion  = (1'b1 => 1'b0);
-      bins reset_release = (1'b0 => 1'b1);
+    cp_fe_egress_credit_fsm_state: coverpoint egress_fsm_state
+      iff (fsm_sample_valid) {
+      bins idle        = {3'd0};
+      bins init        = {3'd1};
+      bins run         = {3'd2};
+      bins deinit_mst  = {3'd3};
+      bins deinit_slv  = {3'd4};
+      bins startup     = (3'd0 => 3'd1 => 3'd2);
+      bins mst_deinit  = (3'd2 => 3'd3 => 3'd0);
+      bins slv_deinit  = (3'd2 => 3'd4 => 3'd0);
     }
 
-    cp_mst_req: coverpoint mst_req {
-      bins deasserted = {1'b0};
-      bins asserted   = {1'b1};
-      bins rise       = (1'b0 => 1'b1);
-      bins fall       = (1'b1 => 1'b0);
+    cp_fe_ingress_credit_fsm_state: coverpoint ingress_fsm_state
+      iff (fsm_sample_valid) {
+
+      bins idle       = {3'd0};
+      bins init       = {3'd1};
+      bins run        = {3'd2};
+      bins deinit_mst = {3'd3};
+      bins deinit_slv = {3'd4};
+
+      bins startup    = (3'd0 => 3'd1 => 3'd2);
+      bins mst_deinit = (3'd2 => 3'd3 => 3'd0);
+      bins slv_deinit = (3'd2 => 3'd4 => 3'd0);
     }
 
-    cp_mst_ack: coverpoint mst_ack {
-      bins deasserted = {1'b0};
-      bins asserted   = {1'b1};
-      bins rise       = (1'b0 => 1'b1);
-      bins fall       = (1'b1 => 1'b0);
-    }
-
-    cr_handshake: cross cp_mst_req, cp_mst_ack;
-  endgroup : cg_m2s_link
-
-  // -------------------------------------------------------------------------
-  // Observable S2M link input coverage
-  // -------------------------------------------------------------------------
-  covergroup cg_s2m_link with function sample(
-    input bit rst_n,
-    input bit slv_req,
-    input bit slv_ack
-  );
-    option.per_instance = 1;
-
-    // Track reset assertions
-    cp_reset: coverpoint rst_n {
-      bins asserted      = {1'b0};
-      bins deasserted    = {1'b1};
-      bins assertion     = (1'b1 => 1'b0);
-      bins reset_release = (1'b0 => 1'b1);
-    }
-
-    // S2M interface activation request (DUT -> TB)
-    cp_slv_req: coverpoint slv_req {
-      bins deasserted = {1'b0};
-      bins asserted   = {1'b1};
-      bins rise       = (1'b0 => 1'b1);
-      bins fall       = (1'b1 => 1'b0);
-    }
-
-    // S2M interface active acknowledge (TB -> DUT)
-    cp_slv_ack: coverpoint slv_ack {
-      bins deasserted = {1'b0};
-      bins asserted   = {1'b1};
-      bins rise       = (1'b0 => 1'b1);
-      bins fall       = (1'b1 => 1'b0);
-    }
-
-    // Cross-coverage automatically bins all 4 static FSM states (2'b00, 2'b01, 2'b10, 2'b11) 
-    // to verify the link walks through IDLE, INIT, RUN, and DEINIT
-    cr_s2m_handshake: cross cp_slv_req, cp_slv_ack;
-
-  endgroup : cg_s2m_link
-
-  // -------------------------------------------------------------------------
-  // Credit Counters Coverage
-  // Covers the 14 individual 6-bit per-channel credit counters defined in the 
-  // fe_rdl and modeled by the persistent arrays in CXL_Test_bench.
-  // -------------------------------------------------------------------------
-  covergroup cg_credit_counters with function sample(
-    input int unsigned lane_idx,
-    input bit [1:0]    channel_type, // 00: REQ, 01: RWD, 10: NDR, 11: DRC
-    input int unsigned credit_count
-  );
-    option.per_instance = 1;
-
-    // Max lanes across all interfaces is 6 (for NDR)
-    cp_lane_idx: coverpoint lane_idx {
-      bins lanes[] = {[0:5]};
-    }
-
-    // 4 distinct credit interfaces
-    cp_channel_type: coverpoint channel_type {
-      bins req = {2'b00};
-      bins rwd = {2'b01};
-      bins ndr = {2'b10};
-      bins drc = {2'b11};
-    }
-
-    // 6-bit counters tracking up to 32 max credits
-    cp_credit_count: coverpoint credit_count {
+    cp_fe_credit_count_egress: coverpoint credit_count
+      iff (credit_sample_valid && !credit_is_ingress) {
       bins empty    = {0};
       bins partial  = {[1:31]};
-      bins full     = {32};
-      bins overflow = {[33:63]}; // Catches sync loss / overflow conditions
+      bins maximum  = {32};
+      bins overflow = {[33:$]};
     }
 
-    // Cross to ensure every active lane on every interface hits all credit levels
-    cr_type_lane_count: cross cp_channel_type, cp_lane_idx, cp_credit_count {
-      
-      // Ignore non-existent lanes for REQ (valid: 0-3)
-      ignore_bins invalid_req_lanes = binsof(cp_channel_type) intersect {2'b00} && 
-                                      binsof(cp_lane_idx) intersect {[4:5]};
-                                      
-      // Ignore non-existent lanes for RWD (valid: 0-1)
-      ignore_bins invalid_rwd_lanes = binsof(cp_channel_type) intersect {2'b01} && 
-                                      binsof(cp_lane_idx) intersect {[2:5]};
-                                      
-      // Ignore non-existent lanes for DRC (valid: 0-1)      
-      ignore_bins invalid_drc_lanes = binsof(cp_channel_type) intersect {2'b11} && 
-                                      binsof(cp_lane_idx) intersect {[2:5]};
-                                      
-      // NDR uses all 0-5 lanes, so no ignore_bins are needed
+    cp_fe_credit_count_ingress: coverpoint credit_count
+      iff (credit_sample_valid && credit_is_ingress) {
+      bins empty    = {0};
+      bins partial  = {[1:31]};
+      bins maximum  = {32};
+      bins overflow = {[33:$]};
     }
-  endgroup : cg_credit_counters
+
+    cp_fe_credit_overflow_src: coverpoint credit_overflow_src
+      iff (overflow_sample_valid) {
+      bins m2s_req = {2'd0};
+      bins m2s_rwd = {2'd1};
+      bins s2m_ndr = {2'd2};
+      bins s2m_drs = {2'd3};
+    }
+
+    cp_fe_credit_overflow_irq_en: coverpoint credit_overflow_irq_en
+      iff (overflow_sample_valid) {
+      bins disabled = {1'b0};
+      bins enabled  = {1'b1};
+    }
+
+    cr_fe_credit_ovf_x_irqen: cross cp_fe_credit_overflow_src,
+                                      cp_fe_credit_overflow_irq_en;
+  endgroup : cg_fe_credit_manager
 
   // -------------------------------------------------------------------------
   // AXI Address Channel Covergroups (AW / AR)
   // -------------------------------------------------------------------------
-  covergroup cg_axi_aw;
+  covergroup cg_fe_axi_requestor_aw;
     option.per_instance = 1;
-    cp_id   : coverpoint aw.id { bins ids[4] = {[0:3]}; } // Tag FIFOs map to IDs 0-3
-    cp_len  : coverpoint aw.len { bins single_beat = {0}; } // CXL FE transactions are single beat
-    cp_size : coverpoint aw.size { bins size_64b = {6}; bins size_128b = {7}; } // 64B encoding
-    cp_aw_user : coverpoint aw.user { bins user_0 = {'h0};
+    cp_fe_awid   : coverpoint aw.id { bins ids[4] = {[0:3]}; } // Tag FIFOs map to IDs 0-3
+    cp_fe_awlen  : coverpoint aw.len { bins single_beat = {0}; } // CXL FE transactions are single beat
+    cp_fe_awsize : coverpoint aw.size { bins size_64b = {6}; bins size_128b = {7}; } // 64B encoding
+    cp_fe_aw_user : coverpoint aw.user { bins user_0 = {'h0};
                                       bins user_7 = {'h80};
                                       illegal_bins others = default; }
 
-    cp_poison_check_0: coverpoint rwd_poison[0];
-    cp_poison_check_1: coverpoint rwd_poison[1] iff (flit_mode_inst == 1'b1);
+    cp_fe_poison_check_0: coverpoint rwd_poison[0];
+    cp_fe_poison_check_1: coverpoint rwd_poison[1] iff (flit_mode_inst == 1'b1);
 
     // Cross
-    cr_id_size : cross cp_id, cp_size;
-    cr_id_poison_0 : cross cp_id, cp_aw_user, poison_crc_invert_enable_inst, cp_poison_check_0;
-    cr_id_poison_1 : cross cp_id, cp_aw_user, poison_crc_invert_enable_inst, cp_poison_check_1 iff (flit_mode_inst == 1'b1);
+    cr_fe_id_size : cross cp_fe_awid, cp_fe_awsize;
+    cr_fe_id_poison_0 : cross cp_fe_awid, cp_fe_aw_user, poison_crc_invert_enable_inst, cp_fe_poison_check_0;
+    cr_fe_id_poison_1 : cross cp_fe_awid, cp_fe_aw_user, poison_crc_invert_enable_inst, cp_fe_poison_check_1 iff (flit_mode_inst == 1'b1);
   endgroup
 
-  covergroup cg_axi_ar;
+  covergroup cg_fe_axi_requestor_ar;
     option.per_instance = 1;
-    cp_id   : coverpoint ar.id { bins ids[4] = {[0:3]}; } 
-    cp_len  : coverpoint ar.len { bins single_beat = {0}; }
-    cp_size : coverpoint ar.size { bins size_64b = {6}; bins size_128b = {7}; }
+    cp_fe_arid   : coverpoint ar.id { bins ids[4] = {[0:3]}; } 
+    cp_fe_arlen  : coverpoint ar.len { bins single_beat = {0}; }
+    cp_fe_arsize : coverpoint ar.size { bins size_64b = {6}; bins size_128b = {7}; }
   endgroup
 
   // -------------------------------------------------------------------------
   // AXI Data & Response Channel Covergroups (W, B, R)
   // -------------------------------------------------------------------------
-  covergroup cg_axi_w;
+  covergroup cg_fe_axi_requestor_w;
     option.per_instance = 1;
-    cp_last : coverpoint w.last { bins asserted = {1'b1}; }
+    cp_fe_wlast : coverpoint w.last { bins asserted = {1'b1}; }
   endgroup
 
-  covergroup cg_axi_b;
+  // Compare the parity of each complete CXL lane against its monitor check
+  // bits. A packet fails if any of its byte check bits differs.
+  covergroup cg_fe_axi_requestor_parity with function sample(
+    input bit direction_is_ingress,
+    input bit packet_is_data,
+    input bit parity_error
+  );
     option.per_instance = 1;
-    cp_id   : coverpoint b.id { bins ids[4] = {[0:3]}; }
-    cp_resp : coverpoint b.resp { 
-      bins okay   = {2'b01};
-      bins slverr = {2'b11};
-      //bins decerr = {2'b11};
-    }
-  endgroup
 
-  covergroup cg_axi_r;
-    option.per_instance = 1;
-    cp_id   : coverpoint r.id { bins ids[4] = {[0:3]}; }
-    cp_last : coverpoint r.last { bins asserted = {1'b1}; }
-    cp_resp : coverpoint r.resp { 
-      bins okay   = {2'b01};
-      bins slverr = {2'b11};
-      //bins decerr = {2'b11};
+    cp_fe_axi_egress_parity: coverpoint {packet_is_data, parity_error}
+      iff (!direction_is_ingress) {
+      bins valid_req_parity   = {2'b00};
+      bins invalid_req_parity = {2'b01};
+      bins valid_rwd_parity   = {2'b10};
+      bins invalid_rwd_parity = {2'b11};
     }
-  endgroup
+
+    cp_fe_axi_ingress_parity: coverpoint {packet_is_data, parity_error}
+      iff (direction_is_ingress) {
+      bins valid_ndr_parity   = {2'b00};
+      bins invalid_ndr_parity = {2'b01};
+      bins valid_drs_parity   = {2'b10};
+      bins invalid_drs_parity = {2'b11};
+    }
+  endgroup : cg_fe_axi_requestor_parity
+
+  // -------------------------------------------------------------------------
+  // AXI responder coverage
+  //
+  // resp is normalized to the AMBA encoding by convert_to_b/convert_to_r:
+  //   OKAY=2'b00, EXOKAY=2'b01, SLVERR=2'b10, DECERR=2'b11.
+  // -------------------------------------------------------------------------
+  covergroup cg_fe_axi_responder with function sample(
+    input bit       response_is_read,
+    input bit [7:0] response_id,
+    input bit [1:0] response,
+    input bit       response_last,
+    input bit       response_user7
+  );
+    option.per_instance = 1;
+
+    cp_fe_bresp: coverpoint response iff (!response_is_read) {
+      bins okay   = {2'b00};
+      bins slverr = {2'b10};
+      bins decerr = {2'b11};
+      illegal_bins exokay = {2'b01};
+    }
+
+    cp_fe_bid: coverpoint response_id iff (!response_is_read) {
+      bins id_0 = {8'd0};
+      bins id_1 = {8'd1};
+      bins id_2 = {8'd2};
+      bins id_3 = {8'd3};
+      illegal_bins unsupported_id = default;
+    }
+
+    cp_fe_rresp: coverpoint response iff (response_is_read) {
+      bins okay   = {2'b00};
+      bins slverr = {2'b10};
+      bins decerr = {2'b11};
+      illegal_bins exokay = {2'b01};
+    }
+
+    cp_fe_rid: coverpoint response_id iff (response_is_read) {
+      bins id_0 = {8'd0};
+      bins id_1 = {8'd1};
+      bins id_2 = {8'd2};
+      bins id_3 = {8'd3};
+      illegal_bins unsupported_id = default;
+    }
+
+    // FE transactions use ARLEN=0, so every read response must assert RLAST.
+    cp_fe_rlast: coverpoint response_last iff (response_is_read) {
+      bins asserted = {1'b1};
+      ignore_bins deasserted = {1'b0};
+    }
+
+    // Encoding: {response_is_read, USER[7]}. Sample only successful
+    // responses, as required by the coverage plan.
+    cp_fe_resp_crc_user: coverpoint {response_is_read, response_user7}
+      iff (response == 2'b00) {
+      bins buser7_clear = {2'b00};
+      bins buser7_set   = {2'b01};
+      bins ruser7_clear = {2'b10};
+      bins ruser7_set   = {2'b11};
+    }
+  endgroup : cg_fe_axi_responder
+
+  // -------------------------------------------------------------------------
+  // FE error and interrupt coverage
+  // -------------------------------------------------------------------------
+  covergroup cg_fe_error_interrupt with function sample(
+    input bit       source_valid,
+    input bit [3:0] error_source,
+    input bit       source_irq_enable,
+    input bit       irq_global_enable,
+    input bit [1:0] multi_error_event
+  );
+    option.per_instance = 1;
+
+    cp_fe_error_source: coverpoint error_source iff (source_valid) {
+      bins unsupported_req  = {4'd0};
+      bins unsupported_rwd  = {4'd1};
+      bins poison_received  = {4'd2};
+      bins parity_error_req = {4'd3};
+      bins parity_error_rwd = {4'd4};
+      bins req_fifo_ovf     = {4'd5};
+      bins rwd_fifo_ovf     = {4'd6};
+      bins hdm_miss         = {4'd7};
+      bins permission_error = {4'd8};
+      bins tag_range_error  = {4'd9};
+      bins eg_queue_ovf     = {4'd10};
+      bins drs_credit_ovf   = {4'd11};
+      bins ndr_credit_ovf   = {4'd12};
+      bins mem_ded          = {4'd13};
+    }
+
+    // Event encoding is generated by sample_error_interrupt():
+    //   1 = at least three error-status bits active together
+    //   2 = exactly one previously-active bit cleared while others remain
+    cp_fe_multi_error: coverpoint multi_error_event
+      iff (multi_error_event != 2'd0) {
+      bins three_or_more_simultaneous = {2'd1};
+      bins cleared_one_at_a_time      = {2'd2};
+    }
+
+    cp_fe_source_irq_enable: coverpoint source_irq_enable iff (source_valid) {
+      bins disabled = {1'b0};
+      bins enabled  = {1'b1};
+    }
+
+    cp_fe_global_irq_enable: coverpoint irq_global_enable iff (source_valid) {
+      bins disabled = {1'b0};
+      bins enabled  = {1'b1};
+    }
+
+    cr_fe_irqen_x_global: cross cp_fe_error_source,
+                                  cp_fe_source_irq_enable,
+                                  cp_fe_global_irq_enable;
+  endgroup : cg_fe_error_interrupt
 
   extern function new(string name = "kb_fwd_eng_coverage",
                       uvm_component parent = null);
+  extern function void build_phase(uvm_phase phase);
   extern task run_phase(uvm_phase phase);
   extern function void report_phase(uvm_phase phase);
   extern function void reset_config_shadow();
@@ -998,12 +1173,33 @@ class kb_fwd_eng_coverage extends uvm_component;
   extern function void sample_rwd_inputs(kb_cxl_m2s_snap snap);
   extern function void sample_ndr_outputs(kb_cxl_s2m_snap snap);
   extern function void sample_drc_outputs(kb_cxl_s2m_snap snap);
+  extern function bit calculate_req_parity_error(kb_cxl_m2s_snap snap,
+                                                 int unsigned lane);
+  extern function bit calculate_rwd_parity_error(kb_cxl_m2s_snap snap,
+                                                 int unsigned lane);
+  extern function bit calculate_ndr_parity_error(kb_cxl_s2m_snap snap,
+                                                 int unsigned lane);
+  extern function bit calculate_drs_parity_error(kb_cxl_s2m_snap snap,
+                                                 int unsigned lane);
   extern task apb_configure(kb_apb3_vendor_txn_t txn);
   extern function void convert_to_aw(kb_axi4_vendor_txn_t txn);
   extern function void convert_to_ar(kb_axi4_vendor_txn_t txn);
   extern function void convert_to_w(kb_axi4_vendor_txn_t txn);
   extern function void convert_to_b(kb_axi4_vendor_txn_t txn);
   extern function void convert_to_r(kb_axi4_vendor_txn_t txn);
+  extern function void sample_error_interrupt(bit [19:0] status_value);
+  extern function void sample_credit_manager_fsm(
+    bit rst_n,
+    bit mst_req,
+    bit mst_ack,
+    bit slv_req,
+    bit slv_ack
+  );
+  extern function void sample_credit_count(
+    bit          is_ingress,
+    int unsigned count
+  );
+  extern task sample_credit_counters_from_regblock();
 
 endclass : kb_fwd_eng_coverage
 
@@ -1012,6 +1208,10 @@ function kb_fwd_eng_coverage::new(
   uvm_component parent = null
 );
   super.new(name, parent);
+
+  //SB to Coverage fifo
+  cov_fifo         = new("cov_fifo", this);
+
   //apb_fifo
   apb_fifo         = new("h_apb_fifo", this);
 
@@ -1025,27 +1225,41 @@ function kb_fwd_eng_coverage::new(
   resp_fifo       = new("resp_fifo", this);
 
   //cover groups
-  cg_req_packet             = new();
-  cg_rwd_packet             = new();
-  cg_s2m_drc_packet         = new();
-  cg_s2m_ndr_packet         = new();
-  cg_combining              = new();
-  cg_apb_config             = new();
-  cg_m2s_link               = new();
-  cg_s2m_link               = new();
-  cg_credit_counters        = new();
-  cg_axi_aw                 = new();
-  cg_axi_w                  = new();
-  cg_axi_b                  = new();
-  cg_axi_ar                 = new();
-  cg_axi_r                  = new();
+  cg_fe_cxl_parser_req             = new();
+  cg_fe_cxl_parser_rwd             = new();
+  cg_fe_cxl_encap_drs         = new();
+  cg_fe_cxl_encap_ndr         = new();
+  cg_fe_cxl_parser_combining              = new();
+  cg_fe_apb_registers             = new();
+  cg_fe_credit_manager                 = new();
+  cg_fe_axi_requestor_aw                 = new();
+  cg_fe_axi_requestor_w                  = new();
+  cg_fe_axi_requestor_parity             = new();
+  cg_fe_axi_responder                    = new();
+  cg_fe_error_interrupt                  = new();
+  cg_fe_axi_requestor_ar                 = new();
+  cg_fe_tag_fifo = new();
 
   reset_seen = 1'b0;
+  fe_error_status_prev       = '0;
+  fe_error_status_prev_valid = 1'b0;
+  credit_egress_state        = 3'd0;
+  credit_ingress_state       = 3'd0;
   reset_config_shadow();
 
   // Record architectural defaults even when a test performs no APB writes.
-  cg_apb_config.sample();
+  cg_fe_apb_registers.sample();
 endfunction : new
+
+function void kb_fwd_eng_coverage::build_phase(uvm_phase phase);
+  super.build_phase(phase);
+
+  if (!uvm_config_db#(kb_fwd_eng_env_cfg)::get(this, "", "env_cfg", h_env_cfg))
+    `uvm_fatal(get_type_name(), "Missing env_cfg; cannot sample credit counters from the RAL model")
+
+  if (!h_env_cfg.has_regblock_en || h_env_cfg.h_regblock == null)
+    `uvm_fatal(get_type_name(), "RAL model is disabled or h_regblock is null")
+endfunction : build_phase
 
 function void kb_fwd_eng_coverage::reset_config_shadow();
   flit_mode_inst                       = 1'b1;
@@ -1054,6 +1268,11 @@ function void kb_fwd_eng_coverage::reset_config_shadow();
   unsupported_opcode_check_enable_inst = 1'b1;
   unsupported_field_check_enable_inst  = 1'b1;
   poison_crc_invert_enable_inst        = 1'b1;
+  fe_error_status_inst                 = '0;
+  fe_error_status_prev                 = '0;
+  fe_error_status_prev_valid           = 1'b0;
+  credit_egress_state                  = 3'd0;
+  credit_ingress_state                 = 3'd0;
 
   foreach (req_seen_valid[i]) begin
     req_seen_valid[i] = 1'b0;
@@ -1086,28 +1305,25 @@ task kb_fwd_eng_coverage::cxl_configure();
     cxl_m2s_bus_fifo.get(h_cxl_m2s_items);
     cxl_s2m_bus_fifo.get(h_cxl_s2m_items);
 
-    cg_m2s_link.sample(
+    sample_credit_manager_fsm(
       h_cxl_m2s_items.rst_n,
       h_cxl_m2s_items.mst_req,
-      h_cxl_m2s_items.mst_ack
+      h_cxl_m2s_items.mst_ack,
+      h_cxl_s2m_items.slv_req,
+      h_cxl_s2m_items.slv_ack
     );
-
-    cg_s2m_link.sample(
-    h_cxl_s2m_items.rst_n,
-    h_cxl_s2m_items.slv_req,
-    h_cxl_s2m_items.slv_ack
-  );
 
     if (!h_cxl_m2s_items.rst_n) begin
       if (!reset_seen) begin
         reset_config_shadow();
-        cg_apb_config.sample();
+        cg_fe_apb_registers.sample();
         reset_seen = 1'b1;
       end
       continue;
     end
 
     reset_seen = 1'b0;
+    sample_credit_counters_from_regblock();
     sample_req_inputs(h_cxl_m2s_items);
     sample_rwd_inputs(h_cxl_m2s_items);
     sample_ndr_outputs(h_cxl_s2m_items);
@@ -1115,33 +1331,72 @@ task kb_fwd_eng_coverage::cxl_configure();
   end
 endtask : cxl_configure
 
+// Read the live hardware values through the generated register model's RTL
+// backdoor. This observes the counters without adding APB traffic or depending
+// on software to read the volatile RO registers first.
+task kb_fwd_eng_coverage::sample_credit_counters_from_regblock();
+  uvm_status_e   status;
+  uvm_reg_data_t count;
+
+  h_env_cfg.h_regblock.credit_manager_debug.m2s_req_crd_cnt.peek(
+    status, count, "RTL"
+  );
+  if (status == UVM_IS_OK)
+    sample_credit_count(1'b0, int'(count));
+
+  h_env_cfg.h_regblock.credit_manager_debug.m2s_rwd_crd_cnt.peek(
+    status, count, "RTL"
+  );
+  if (status == UVM_IS_OK)
+    sample_credit_count(1'b0, int'(count));
+
+  h_env_cfg.h_regblock.credit_manager_debug.s2m_ndr_crd_cnt0.peek(
+    status, count, "RTL"
+  );
+  if (status == UVM_IS_OK)
+    sample_credit_count(1'b1, int'(count));
+
+  h_env_cfg.h_regblock.credit_manager_debug.s2m_ndr_crd_cnt1.peek(
+    status, count, "RTL"
+  );
+  if (status == UVM_IS_OK)
+    sample_credit_count(1'b1, int'(count));
+
+  h_env_cfg.h_regblock.credit_manager_debug.s2m_drs_crd_cnt.peek(
+    status, count, "RTL"
+  );
+  if (status == UVM_IS_OK)
+    sample_credit_count(1'b1, int'(count));
+endtask : sample_credit_counters_from_regblock
+
 task kb_fwd_eng_coverage::axi_configure();
-  forever begin
-    kb_axi4_vendor_txn_t  h_axi_txns;
-    
-    address_fifo.get(h_axi_txns);
-    if (h_axi_txns.Direction == DENALI_CDN_AXI_DIRECTION_WRITE)
-      convert_to_aw(h_axi_txns);
-    else
-      convert_to_ar(h_axi_txns);
-  end
+  fork
+    forever begin
+      kb_axi4_vendor_txn_t  h_axi_txns;
+      
+      address_fifo.get(h_axi_txns);
+      if (h_axi_txns.Direction == DENALI_CDN_AXI_DIRECTION_WRITE)
+        convert_to_aw(h_axi_txns);
+      else
+        convert_to_ar(h_axi_txns);
+    end
 
-  forever begin
-    kb_axi4_vendor_txn_t  h_axi_txns;
-    w_fifo.get(h_axi_txns);
-    if (h_axi_txns.Direction == DENALI_CDN_AXI_DIRECTION_WRITE)
-      convert_to_w(h_axi_txns);
-  end
+    forever begin
+      kb_axi4_vendor_txn_t  h_axi_txns;
+      w_fifo.get(h_axi_txns);
+      if (h_axi_txns.Direction == DENALI_CDN_AXI_DIRECTION_WRITE)
+        convert_to_w(h_axi_txns);
+    end
 
-  forever begin
-    kb_axi4_vendor_txn_t  h_axi_txns;
-    resp_fifo.get(h_axi_txns);
-    if (h_axi_txns.Direction == DENALI_CDN_AXI_DIRECTION_WRITE)
-      convert_to_b(h_axi_txns);
-    else
-      convert_to_r(h_axi_txns);
-  end
-
+    forever begin
+      kb_axi4_vendor_txn_t  h_axi_txns;
+      resp_fifo.get(h_axi_txns);
+      if (h_axi_txns.Direction == DENALI_CDN_AXI_DIRECTION_WRITE)
+        convert_to_b(h_axi_txns);
+      else
+        convert_to_r(h_axi_txns);
+    end
+  join
 endtask : axi_configure
 
 
@@ -1152,20 +1407,113 @@ endtask : axi_configure
 //function void kb_fwd_eng_coverage::sample_all_credits();
 //    // Sample M2S REQ (4 channels)
 //    for (int i = 0; i < KB_CXL_MAX_NUM_REQ; i++)
-//      cg_credit_counters.sample(i, 2'b00, exp_req_credits[i]);
+//      sample_credit_count(1'b0, exp_req_credits[i]);
 //      
 //    // Sample M2S RWD (2 channels)
 //    for (int i = 0; i < KB_CXL_MAX_NUM_RWD; i++)
-//      cg_credit_counters.sample(i, 2'b01, exp_rwd_credits[i]);
+//      sample_credit_count(1'b0, exp_rwd_credits[i]);
 //      
 //    // Sample S2M NDR (6 channels)
 //    for (int i = 0; i < KB_CXL_MAX_NUM_NDR; i++)
-//      cg_credit_counters.sample(i, 2'b10, exp_s2m_ndr_credits[i]);
+//      sample_credit_count(1'b1, exp_s2m_ndr_credits[i]);
 //      
 //    // Sample S2M DRC (2 channels)
 //    for (int i = 0; i < KB_CXL_MAX_NUM_DRC; i++)
-//      cg_credit_counters.sample(i, 2'b11, exp_s2m_drc_credits[i]);
+//      sample_credit_count(1'b1, exp_s2m_drc_credits[i]);
 //  endfunction
+
+// The error flag is local to each call, so it starts clear for every packet.
+// REQ is 100 bits; append four zero bits at the LSB to form 13 bytes,
+// matching the updated CXL driver. Each check bit uses odd parity.
+function bit kb_fwd_eng_coverage::calculate_req_parity_error(
+  kb_cxl_m2s_snap snap,
+  int unsigned lane
+);
+  bit parity_error;
+  logic [KB_CXL_REQ_SIZE-1:0] req_packet;
+  logic [(KB_CXL_REQ_CHK_SIZE*8)-1:0] req_padded;
+  logic [KB_CXL_REQ_CHK_SIZE-1:0] received_parity;
+
+  parity_error = 1'b0;
+  req_packet = snap.m2s_req[lane*KB_CXL_REQ_SIZE +: KB_CXL_REQ_SIZE];
+  req_padded = {req_packet, 4'b0000};
+  received_parity = snap.m2s_req_chk[
+    lane*KB_CXL_REQ_CHK_SIZE +: KB_CXL_REQ_CHK_SIZE
+  ];
+
+  for (int byte_idx = 0; byte_idx < KB_CXL_REQ_CHK_SIZE; byte_idx++) begin
+    if ((~(^req_padded[byte_idx*8 +: 8])) !== received_parity[byte_idx])
+      parity_error = 1'b1;
+  end
+
+  return parity_error;
+endfunction : calculate_req_parity_error
+
+function bit kb_fwd_eng_coverage::calculate_rwd_parity_error(
+  kb_cxl_m2s_snap snap,
+  int unsigned lane
+);
+  bit parity_error;
+  logic [KB_CXL_RWD_SIZE-1:0] rwd_packet;
+  logic [KB_CXL_RWD_CHK_SIZE-1:0] received_parity;
+
+  parity_error = 1'b0;
+  rwd_packet = snap.m2s_rwd[lane*KB_CXL_RWD_SIZE +: KB_CXL_RWD_SIZE];
+  received_parity = snap.m2s_rwd_chk[
+    lane*KB_CXL_RWD_CHK_SIZE +: KB_CXL_RWD_CHK_SIZE
+  ];
+
+  for (int byte_idx = 0; byte_idx < KB_CXL_RWD_CHK_SIZE; byte_idx++) begin
+    if ((~(^rwd_packet[byte_idx*8 +: 8])) !== received_parity[byte_idx])
+      parity_error = 1'b1;
+  end
+
+  return parity_error;
+endfunction : calculate_rwd_parity_error
+
+function bit kb_fwd_eng_coverage::calculate_ndr_parity_error(
+  kb_cxl_s2m_snap snap,
+  int unsigned lane
+);
+  bit parity_error;
+  logic [KB_CXL_NDR_SIZE-1:0] ndr_packet;
+  logic [KB_CXL_NDR_CHK_SIZE-1:0] received_parity;
+
+  parity_error = 1'b0;
+  ndr_packet = snap.s2m_ndr[lane*KB_CXL_NDR_SIZE +: KB_CXL_NDR_SIZE];
+  received_parity = snap.s2m_ndr_chk[
+    lane*KB_CXL_NDR_CHK_SIZE +: KB_CXL_NDR_CHK_SIZE
+  ];
+
+  for (int byte_idx = 0; byte_idx < KB_CXL_NDR_CHK_SIZE; byte_idx++) begin
+    if ((~(^ndr_packet[byte_idx*8 +: 8])) !== received_parity[byte_idx])
+      parity_error = 1'b1;
+  end
+
+  return parity_error;
+endfunction : calculate_ndr_parity_error
+
+function bit kb_fwd_eng_coverage::calculate_drs_parity_error(
+  kb_cxl_s2m_snap snap,
+  int unsigned lane
+);
+  bit parity_error;
+  logic [KB_CXL_DRC_SIZE-1:0] drs_packet;
+  logic [KB_CXL_DRC_CHK_SIZE-1:0] received_parity;
+
+  parity_error = 1'b0;
+  drs_packet = snap.s2m_drc[lane*KB_CXL_DRC_SIZE +: KB_CXL_DRC_SIZE];
+  received_parity = snap.s2m_drc_chk[
+    lane*KB_CXL_DRC_CHK_SIZE +: KB_CXL_DRC_CHK_SIZE
+  ];
+
+  for (int byte_idx = 0; byte_idx < KB_CXL_DRC_CHK_SIZE; byte_idx++) begin
+    if ((~(^drs_packet[byte_idx*8 +: 8])) !== received_parity[byte_idx])
+      parity_error = 1'b1;
+  end
+
+  return parity_error;
+endfunction : calculate_drs_parity_error
 
 function void kb_fwd_eng_coverage::sample_req_inputs(
   kb_cxl_m2s_snap snap
@@ -1192,6 +1540,9 @@ function void kb_fwd_eng_coverage::sample_req_inputs(
     gap_class = 0;
 
     if (snap.req_items[i].valid) begin
+      cg_fe_axi_requestor_parity.sample(
+        1'b0, 1'b0, calculate_req_parity_error(snap, i)
+      );
       gap_available = req_seen_valid[i];
       gap_class = req_gap_cycles[i];
       req_concurrency++;
@@ -1217,7 +1568,7 @@ function void kb_fwd_eng_coverage::sample_req_inputs(
 
     // Sample every active lane each cycle so cp_valid sees both values.
     // Packet coverpoints/crosses are gated by req_valid inside the covergroup.
-    cg_req_packet.sample(
+    cg_fe_cxl_parser_req.sample(
       i,
       req_valid[i],
       flit_mode_inst,
@@ -1261,9 +1612,11 @@ function void kb_fwd_eng_coverage::sample_req_inputs(
     end
 
     if (snap.req_items[i].valid || snap.req_items[i+1].valid) begin
-      cg_combining.sample(
+      cg_fe_cxl_parser_combining.sample(
         1'b0,
         combining_rd_enable_inst,
+        combining_wr_enable_inst,
+        i,
         pair_present,
         aligned,
         contiguous
@@ -1298,6 +1651,9 @@ function void kb_fwd_eng_coverage::sample_rwd_inputs(
     rwd_gap_class = 0;
 
     if (snap.rwd_items[i].valid) begin
+      cg_fe_axi_requestor_parity.sample(
+        1'b0, 1'b1, calculate_rwd_parity_error(snap, i)
+      );
       rwd_gap_available = rwd_seen_valid[i];
       rwd_gap_class = rwd_gap_cycles[i];
       rwd_concurrency++;
@@ -1313,12 +1669,12 @@ function void kb_fwd_eng_coverage::sample_rwd_inputs(
       rwd_poison[i]     = snap.rwd_items[i].poison;
       
       // Note: rwd_data and byte_enable are populated here for completeness, 
-      // even if cg_rwd_packet does not currently sample them.
+      // even if cg_fe_cxl_parser_rwd does not currently sample them.
       rwd_data[i]       = snap.rwd_items[i].wdata;
       byte_enable[i]    = snap.rwd_items[i].byte_enable;
 
       // 2. Sample the covergroup using the local array variables
-      cg_rwd_packet.sample(
+      cg_fe_cxl_parser_rwd.sample(
         i,
         rwd_valid[i],
         flit_mode_inst,
@@ -1358,9 +1714,11 @@ function void kb_fwd_eng_coverage::sample_rwd_inputs(
     end
 
     if (snap.rwd_items[0].valid || snap.rwd_items[1].valid) begin
-      cg_combining.sample(
+      cg_fe_cxl_parser_combining.sample(
         1'b1,
+        combining_rd_enable_inst,
         combining_wr_enable_inst,
+        3'd3,
         pair_present,
         aligned,
         contiguous
@@ -1372,7 +1730,7 @@ endfunction : sample_rwd_inputs
 function void kb_fwd_eng_coverage::sample_ndr_outputs(kb_cxl_s2m_snap snap);
   for (int i = 0; i < KB_CXL_MAX_NUM_NDR; i++) begin
     if (snap.ndr_items[i].valid) begin
-      cg_s2m_ndr_packet.sample(
+      cg_fe_cxl_encap_ndr.sample(
         i,
         snap.ndr_items[i].s2m_ndr_opcode,
         snap.ndr_items[i].s2m_meta_field,
@@ -1393,6 +1751,9 @@ function void kb_fwd_eng_coverage::sample_ndr_outputs(kb_cxl_s2m_snap snap);
 
   for (int i = 0; i < max_ndr_lanes; i++) begin
     if (snap.ndr_items[i].valid) begin
+      cg_fe_axi_requestor_parity.sample(
+        1'b1, 1'b0, calculate_ndr_parity_error(snap, i)
+      );
       // 1. Populate the local arrays for the active NDR lane
       ndr_opcode[i]     = snap.ndr_items[i].s2m_ndr_opcode;
       ndr_meta_field[i] = snap.ndr_items[i].s2m_meta_field;
@@ -1402,7 +1763,7 @@ function void kb_fwd_eng_coverage::sample_ndr_outputs(kb_cxl_s2m_snap snap);
       ndr_dev_load[i]   = snap.ndr_items[i].s2m_dev_load;
 
       // 2. Sample the covergroup using the local array variables
-      cg_s2m_ndr_packet.sample(
+      cg_fe_cxl_encap_ndr.sample(
         i,
         ndr_opcode[i],
         ndr_meta_field[i],
@@ -1419,6 +1780,9 @@ endfunction : sample_ndr_outputs
 function void kb_fwd_eng_coverage::sample_drc_outputs(kb_cxl_s2m_snap snap);
   for (int i = 0; i < KB_CXL_MAX_NUM_DRC; i++) begin
     if (snap.drc_items[i].valid) begin
+      cg_fe_axi_requestor_parity.sample(
+        1'b1, 1'b1, calculate_drs_parity_error(snap, i)
+      );
       // 1. Populate the local arrays for the active DRC lane
       drc_opcode[i]     = snap.drc_items[i].s2m_drc_opcode;
       drc_meta_field[i] = snap.drc_items[i].s2m_meta_field;
@@ -1431,7 +1795,7 @@ function void kb_fwd_eng_coverage::sample_drc_outputs(kb_cxl_s2m_snap snap);
 
       // 2. Sample the covergroup using the local array variables, 
       // explicitly passing the lane index 'i' as the first argument[cite: 2]
-      cg_s2m_drc_packet.sample(
+      cg_fe_cxl_encap_drs.sample(
         i,
         drc_opcode[i],
         drc_meta_field[i],
@@ -1446,9 +1810,174 @@ function void kb_fwd_eng_coverage::sample_drc_outputs(kb_cxl_s2m_snap snap);
   end
 endfunction : sample_drc_outputs
 
+function void kb_fwd_eng_coverage::sample_credit_manager_fsm(
+  bit rst_n,
+  bit mst_req,
+  bit mst_ack,
+  bit slv_req,
+  bit slv_ack
+);
+  if (!rst_n) begin
+    credit_egress_state  = 3'd0;
+    credit_ingress_state = 3'd0;
+  end else begin
+
+    // Egress: distinguish INIT from DEINIT_SLV using state history.
+    case ({mst_req, mst_ack})
+      2'b00: credit_egress_state = 3'd0; // IDLE
+      2'b11: credit_egress_state = 3'd2; // RUN
+      2'b01: credit_egress_state = 3'd3; // DEINIT_MST
+
+      2'b10: begin
+        if (credit_egress_state inside {3'd2, 3'd4})
+          credit_egress_state = 3'd4;    // DEINIT_SLV
+        else
+          credit_egress_state = 3'd1;    // INIT
+      end
+    endcase
+
+    // Ingress: use its own state history.
+    case ({slv_req, slv_ack})
+      2'b00: credit_ingress_state = 3'd0; // IDLE
+      2'b11: credit_ingress_state = 3'd2; // RUN
+      2'b01: credit_ingress_state = 3'd3; // DEINIT_MST
+
+      2'b10: begin
+        if (credit_ingress_state inside {3'd2, 3'd4})
+          credit_ingress_state = 3'd4;    // DEINIT_SLV
+        else
+          credit_ingress_state = 3'd1;    // INIT
+      end
+    endcase
+  end
+
+  cg_fe_credit_manager.sample(
+    1'b1,                  // fsm_sample_valid
+    credit_egress_state,
+    credit_ingress_state,
+    1'b0,                  // credit_sample_valid
+    1'b0,                  // credit_is_ingress
+    0,                     // credit_count
+    1'b0,                  // overflow_sample_valid
+    2'd0,                  // credit_overflow_src
+    1'b0                   // credit_overflow_irq_en
+  );
+endfunction : sample_credit_manager_fsm
+
+// Call this method from the RTL-probe or scoreboard path for every observed
+// ingress/egress credit counter. The current CXL snapshots do not carry the
+// counter values themselves.
+function void kb_fwd_eng_coverage::sample_credit_count(
+  bit          is_ingress,
+  int unsigned count
+);
+  cg_fe_credit_manager.sample(
+    1'b0,
+    credit_egress_state,
+    credit_ingress_state,
+    1'b1,
+    is_ingress,
+    count,
+    1'b0,
+    2'd0,
+    1'b0
+  );
+endfunction : sample_credit_count
+
+function void kb_fwd_eng_coverage::sample_error_interrupt(
+  bit [19:0] status_value
+);
+  bit [1:0] multi_error_event;
+
+  multi_error_event = 2'd0;
+
+  if ($countones(status_value) >= 3) begin
+    multi_error_event = 2'd1;
+  end else if (fe_error_status_prev_valid &&
+               ($countones(fe_error_status_prev) > 1) &&
+               ($countones(fe_error_status_prev & ~status_value) == 1) &&
+               ((status_value & ~fe_error_status_prev) == '0)) begin
+    multi_error_event = 2'd2;
+  end
+
+  // Multi-error behavior is sampled once for each status observation.
+  cg_fe_error_interrupt.sample(
+    1'b0,
+    4'd0,
+    1'b0,
+    interrupt_enables_inst[18],
+    multi_error_event
+  );
+
+  // Sample every asserted physical status bit. Related read/write and checker
+  // status bits map into the logical error-source categories in the plan.
+  for (int unsigned i = 0; i < 18; i++) begin
+    bit       mapped;
+    bit [3:0] source;
+
+    mapped = 1'b1;
+    source = '0;
+
+    case (i)
+      0, 1:  source = 4'd7;   // HDM miss
+      2, 3:  source = 4'd8;   // Permission error
+      4, 5:  source = 4'd9;   // Tag-range error
+      6:     source = 4'd0;   // Unsupported Req
+      7:     source = 4'd1;   // Unsupported RwD
+      8:     source = 4'd2;   // Poison received
+      9, 11: source = 4'd3;   // Req/read-path parity error
+      10,12: source = 4'd4;   // RwD/write-path parity error
+      15:    source = 4'd12;  // NDR credit overflow
+      16:    source = 4'd11;  // DRS credit overflow
+      17:    source = 4'd13;  // Memory/DCD DED
+      // Bits 13 and 14 are queue-threshold indications, not queue-overflow
+      // indications, so they must not hit the eg_queue_ovf plan bin.
+      default: mapped = 1'b0;
+    endcase
+
+    if (status_value[i] && mapped) begin
+      cg_fe_error_interrupt.sample(
+        1'b1,
+        source,
+        interrupt_enables_inst[i],
+        interrupt_enables_inst[18],
+        2'd0
+      );
+
+      // The current status register exposes the S2M NDR/DRS credit-overflow
+      // sources. M2S Req/RwD overflow sources require additional probes.
+      if (i == 15 || i == 16) begin
+        cg_fe_credit_manager.sample(
+          1'b0,
+          credit_egress_state,
+          credit_ingress_state,
+          1'b0,
+          1'b0,
+          0,
+          1'b1,
+          (i == 15) ? 2'd2 : 2'd3,
+          interrupt_enables_inst[i]
+        );
+      end
+    end
+  end
+
+  fe_error_status_inst       = status_value;
+  fe_error_status_prev       = status_value;
+  fe_error_status_prev_valid = 1'b1;
+endfunction : sample_error_interrupt
+
 task kb_fwd_eng_coverage::apb_configure(
   kb_apb3_vendor_txn_t txn
 );
+  // fe_error_status is software read-only and read-clear. Sample the returned
+  // value before the RTL clears its sticky bits.
+  if (txn.Direction == DENALI_CDN_APB_DIRECTION_READ) begin
+    if (txn.Addr == 'h80a00)
+      sample_error_interrupt(txn.Data[17:0]);
+    return;
+  end
+
   if (txn.Direction != DENALI_CDN_APB_DIRECTION_WRITE)
     return;
 
@@ -1483,39 +2012,35 @@ task kb_fwd_eng_coverage::apb_configure(
   end
 
   case (txn.Addr)
-    'h80800: begin
+    'h80300: begin
       flit_mode_inst           = txn.Data[0];
       combining_rd_enable_inst = txn.Data[1];
       combining_wr_enable_inst = txn.Data[2];
-      cg_apb_config.sample();
+      cg_fe_apb_registers.sample();
     end
 
     'h80400: begin 
         mst_req = txn.Data;
-        cg_apb_config.sample();
+        cg_fe_apb_registers.sample();
     end
       
     'h80404: begin
         mst_ack = txn.Data;
-        cg_apb_config.sample();
+        cg_fe_apb_registers.sample();
     end
 
     'h80600: begin
       unsupported_opcode_check_enable_inst = txn.Data[0];
       unsupported_field_check_enable_inst  = txn.Data[1];
       poison_crc_invert_enable_inst         = txn.Data[2];
-      cg_apb_config.sample();
+      cg_fe_apb_registers.sample();
     end
 
     'h80c00: begin
       mem_app_pending_enable    = txn.Data[0]; 
       nxm_enable                = txn.Data[1];
       poison_enable             = txn.Data[2];
-      cg_apb_config.sample();
-    end
-
-    'h80800: begin
-      fe_error_status_inst = txn.Data;
+      cg_fe_apb_registers.sample();
     end
 
     'h80900: begin
@@ -1542,8 +2067,9 @@ task kb_fwd_eng_coverage::apb_configure(
     default: begin
     end
   endcase
-  cg_apb_config.sample();
+  cg_fe_apb_registers.sample();
 endtask : apb_configure
+
 
 // ---------------------------------------------------------------------------
 // AXI Denali VIP to Local Struct Conversions & Sampling
@@ -1561,7 +2087,10 @@ function void kb_fwd_eng_coverage::convert_to_aw(kb_axi4_vendor_txn_t txn);
       aw.user[(i * 32) +: 32] = txn.Auser[i];
     end
     
-    cg_axi_aw.sample();
+    cg_fe_axi_requestor_aw.sample();
+
+    //For aw_id covergroup
+    cg_fe_tag_fifo.sample(1'b1, txn.IdTag);
   end
 endfunction : convert_to_aw
 
@@ -1578,7 +2107,10 @@ function void kb_fwd_eng_coverage::convert_to_ar(kb_axi4_vendor_txn_t txn);
       ar.user[(i * 32) +: 32] = txn.Auser[i];
     end
     
-    cg_axi_ar.sample();
+    cg_fe_axi_requestor_ar.sample();
+
+    //For ar_id covergrop
+    cg_fe_tag_fifo.sample(1'b0, txn.IdTag);
   end
 endfunction : convert_to_ar
 
@@ -1597,7 +2129,7 @@ function void kb_fwd_eng_coverage::convert_to_w(kb_axi4_vendor_txn_t txn);
       w.user[(i * 32) +: 32] = txn.User[i];
     end
     
-    cg_axi_w.sample();
+    cg_fe_axi_requestor_w.sample();
   end
 endfunction : convert_to_w
 
@@ -1612,7 +2144,13 @@ function void kb_fwd_eng_coverage::convert_to_b(kb_axi4_vendor_txn_t txn);
       b.user[(i * 32) +: 32] = txn.Buser[i];
     end
     
-    cg_axi_b.sample();
+    cg_fe_axi_responder.sample(
+      1'b0,
+      b.id,
+      b.resp,
+      1'b0,
+      b.user[7]
+    );
   end
 endfunction : convert_to_b
 
@@ -1632,7 +2170,13 @@ function void kb_fwd_eng_coverage::convert_to_r(kb_axi4_vendor_txn_t txn);
       r.user[(i * 32) +: 32] = txn.User[i];
     end
     
-    cg_axi_r.sample();
+    cg_fe_axi_responder.sample(
+      1'b1,
+      r.id,
+      r.resp,
+      r.last,
+      r.user[7]
+    );
   end
 endfunction : convert_to_r
 
@@ -1641,15 +2185,19 @@ function void kb_fwd_eng_coverage::report_phase(uvm_phase phase);
   super.report_phase(phase);
 
   `uvm_info(get_type_name(), "===== FE INPUT COVERAGE SUMMARY =====", UVM_LOW)
-  `uvm_info(get_type_name(), $sformatf("  REQ Input Coverage     : %0.2f%%", cg_req_packet.get_coverage()), UVM_LOW)
-  `uvm_info(get_type_name(), $sformatf("  RWD Input Coverage     : %0.2f%%", cg_rwd_packet.get_coverage()), UVM_LOW)
-  `uvm_info(get_type_name(), $sformatf("  Combining Coverage     : %0.2f%%", cg_combining.get_coverage()), UVM_LOW)
-  `uvm_info(get_type_name(), $sformatf("  APB Config Coverage    : %0.2f%%", cg_apb_config.get_coverage()), UVM_LOW)
-  `uvm_info(get_type_name(), $sformatf("  M2S Link Coverage      : %0.2f%%", cg_m2s_link.get_coverage()), UVM_LOW)
+  `uvm_info(get_type_name(), $sformatf("  REQ Input Coverage     : %0.2f%%", cg_fe_cxl_parser_req.get_coverage()), UVM_LOW)
+  `uvm_info(get_type_name(), $sformatf("  RWD Input Coverage     : %0.2f%%", cg_fe_cxl_parser_rwd.get_coverage()), UVM_LOW)
+  `uvm_info(get_type_name(), $sformatf("  CXL Parity Coverage    : %0.2f%%", cg_fe_axi_requestor_parity.get_coverage()), UVM_LOW)
+  `uvm_info(get_type_name(), $sformatf("  Combining Coverage     : %0.2f%%", cg_fe_cxl_parser_combining.get_coverage()), UVM_LOW)
+  `uvm_info(get_type_name(), $sformatf("  AXI Responder Coverage : %0.2f%%", cg_fe_axi_responder.get_coverage()), UVM_LOW)
+  `uvm_info(get_type_name(), $sformatf("  Error/IRQ Coverage     : %0.2f%%", cg_fe_error_interrupt.get_coverage()), UVM_LOW)
+  `uvm_info(get_type_name(), $sformatf("  APB Config Coverage    : %0.2f%%", cg_fe_apb_registers.get_coverage()), UVM_LOW)
+  `uvm_info(get_type_name(), $sformatf("  Credit Manager Coverage: %0.2f%%", cg_fe_credit_manager.get_coverage()), UVM_LOW)
   `uvm_info(get_type_name(), "=====================================", UVM_LOW)
 endfunction : report_phase
 
 `endif // KB_FWD_ENG_COVERAGE_SV
+
 
 
 
