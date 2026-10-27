@@ -15,6 +15,9 @@ class kb_fwd_eng_coverage extends uvm_component;
   // analysis_fifo to get the internal variables from Scoreboard to Coverage
   uvm_tlm_analysis_fifo #(kb_fwd_eng_cov_seq_item) cov_fifo;
 
+  // Coverage sequence item class handle
+  kb_fwd_eng_cov_seq_item h_cov_seq_items;
+
   // APB, CXL vip analysis fifo's
   uvm_tlm_analysis_fifo #(denaliCdn_apbTransaction) apb_fifo;
   uvm_tlm_analysis_fifo #(kb_cxl_m2s_snap) cxl_m2s_bus_fifo;
@@ -191,6 +194,59 @@ class kb_fwd_eng_coverage extends uvm_component;
   bit [19:0] fe_error_status_inst;
   bit [19:0] fe_error_status_prev;
   bit        fe_error_status_prev_valid;
+
+  // Egress Queue Local Variables
+  logic [1:0] write_egress_queue_devload;
+  logic [1:0] read_egress_queue_devload;
+
+  //Scoreboard variables
+  // Each sampling source enables only the fields it actually observes.
+  typedef struct packed {
+    bit error_valid;
+    bit packet_valid;
+    bit tag_bounds_valid;
+    bit tag_check_enabled;
+    bit tag_range_checked;
+    bit tag_range_passed;
+    bit [1:0] error_type;
+    bit is_write;
+    bit permission_valid;
+    bit permission_passed;
+    bit axi_valid;
+    bit [1:0] axi_id;
+    // Pair events are separate from the per-lane and AXI-ID samples.
+    bit pair_sample_valid;
+    bit [7:0] axi_size;
+    bit [1:0] tag_pair_checked;
+    bit [1:0] tag_pair_bounds_valid;
+    bit [1:0] tag_pair_passed; // [1] = first queued tag, [0] = second.
+  } hdm_cov_event_t;
+  hdm_cov_event_t hdm_sample;
+
+  // Keep all attributes of one original 64B packet in one queue entry.
+  typedef struct packed {
+    bit tag_bounds_valid;
+    bit tag_range_checked;
+    bit tag_range_passed;
+  } hdm_tag_result_t;
+
+  typedef struct packed {
+    bit [7:0] size; // AXI encoding: 6 = 64B, 7 = 128B per beat.
+    bit [7:0] len;  // This FE pairing supports single-beat requests only.
+  } hdm_axi_size_t;
+
+  hdm_tag_result_t hdm_rd_tag_q[$];
+  hdm_tag_result_t hdm_wr_tag_q[$];
+  hdm_axi_size_t   hdm_rd_axi_q[$];
+  hdm_axi_size_t   hdm_wr_axi_q[$];
+  bit hdm_rd_pairing_blocked;
+  bit hdm_wr_pairing_blocked;
+
+  bit [3:0][1:0] err_resp_type;
+  bit [3:0] tag_bounds_valid;
+  bit [3:0] tag_range_checked;
+  bit [3:0] tag_range_passed;
+  bit tag_range_check;
 
   // -------------------------------------------------------------------------
   // REQ input coverage
@@ -447,14 +503,11 @@ class kb_fwd_eng_coverage extends uvm_component;
   //--------------------------------------------------------------------------
   // Egress_Queue Coverage
   //--------------------------------------------------------------------------
-  covergroup cg_fe_egress_queue with function sample(
-  input logic [1:0] write_devload,
-  input logic [1:0] read_devload
-  );
+covergroup cg_fe_egress_queue;
   option.per_instance = 1;
 
   cp_fe_write_egress_queue_devload:
-    coverpoint write_devload {
+    coverpoint write_egress_queue_devload {
       bins light        = {2'b00};
       bins optimal      = {2'b01};
       bins mod_overload = {2'b10};
@@ -462,7 +515,7 @@ class kb_fwd_eng_coverage extends uvm_component;
     }
 
   cp_fe_read_egress_queue_devload:
-    coverpoint read_devload {
+    coverpoint read_egress_queue_devload {
       bins light        = {2'b00};
       bins optimal      = {2'b01};
       bins mod_overload = {2'b10};
@@ -530,7 +583,36 @@ endgroup : cg_fe_egress_queue
     }
 
     // DevLoad comes from egress queue fill level
-    cp_fe_dev_load: coverpoint dev_load;
+    cp_fe_dev_load: coverpoint dev_load {
+      bins light        = {2'b00};
+      bins optimal      = {2'b01};
+      bins mod_overload = {2'b10};
+      bins severe       = {2'b11};
+
+      // Gradual increase
+      bins rise_00_01 = (2'b00 => 2'b01);
+      bins rise_01_10 = (2'b01 => 2'b10);
+      bins rise_10_11 = (2'b10 => 2'b11);
+
+      // All decreasing-load combinations
+      bins fall_01_00 = (2'b01 => 2'b00);
+      bins fall_10_01 = (2'b10 => 2'b01);
+      bins fall_11_10 = (2'b11 => 2'b10);
+      bins fall_10_00 = (2'b10 => 2'b00);
+      bins fall_11_01 = (2'b11 => 2'b01);
+      bins fall_11_00 = (2'b11 => 2'b00);
+
+      // Load remains unchanged
+      bins steady_00 = (2'b00 => 2'b00);
+      bins steady_01 = (2'b01 => 2'b01);
+      bins steady_10 = (2'b10 => 2'b10);
+      bins steady_11 = (2'b11 => 2'b11);
+
+      // Your requested illegal upward jumps
+      illegal_bins jump_00_10 = (2'b00 => 2'b10);
+      illegal_bins jump_00_11 = (2'b00 => 2'b11);
+      illegal_bins jump_01_11 = (2'b01 => 2'b11);
+    }
 
     cp_fe_tag: coverpoint tag {
       bins tags[8] = {[16'h0000:16'hFFFF]};
@@ -597,7 +679,36 @@ endgroup : cg_fe_egress_queue
     }
 
     // DevLoad comes from egress queue fill level
-    cp_fe_dev_load: coverpoint dev_load;
+    cp_fe_dev_load: coverpoint dev_load {
+      bins light        = {2'b00};
+      bins optimal      = {2'b01};
+      bins mod_overload = {2'b10};
+      bins severe       = {2'b11};
+
+      // Gradual increase
+      bins rise_00_01 = (2'b00 => 2'b01);
+      bins rise_01_10 = (2'b01 => 2'b10);
+      bins rise_10_11 = (2'b10 => 2'b11);
+
+      // All decreasing-load combinations
+      bins fall_01_00 = (2'b01 => 2'b00);
+      bins fall_10_01 = (2'b10 => 2'b01);
+      bins fall_11_10 = (2'b11 => 2'b10);
+      bins fall_10_00 = (2'b10 => 2'b00);
+      bins fall_11_01 = (2'b11 => 2'b01);
+      bins fall_11_00 = (2'b11 => 2'b00);
+
+      // Load remains unchanged
+      bins steady_00 = (2'b00 => 2'b00);
+      bins steady_01 = (2'b01 => 2'b01);
+      bins steady_10 = (2'b10 => 2'b10);
+      bins steady_11 = (2'b11 => 2'b11);
+
+      // Your requested illegal upward jumps
+      illegal_bins jump_00_10 = (2'b00 => 2'b10);
+      illegal_bins jump_00_11 = (2'b00 => 2'b11);
+      illegal_bins jump_01_11 = (2'b01 => 2'b11);
+    }
 
     cp_fe_tag: coverpoint tag {
       bins tags[8] = {[16'h0000:16'hFFFF]};
@@ -616,6 +727,23 @@ endgroup : cg_fe_egress_queue
   // -------------------------------------------------------------------------
   // Combining-eligibility input coverage
   // -------------------------------------------------------------------------
+  // Mirrors the supplied driver's round-robin allocation after observed reset.
+  bit req_order_known;
+  int unsigned req_next_lane;
+  int unsigned req_cycle_start;
+  int unsigned req_previous_count;
+  bit req_previous_four_lane;
+  bit req_partial_previous;
+  bit req_comb_snapshot_sample;
+  bit req_order_pair_sample;
+  bit rwd_order_known;
+  int unsigned rwd_next_lane;
+  int unsigned rwd_cycle_start;
+  int unsigned rwd_previous_count;
+  bit rwd_previous_two_lane;
+  bit rwd_partial_previous;
+  bit rwd_order_pair_sample;
+
   covergroup cg_fe_cxl_parser_combining with function sample(
     input bit path_is_write,
     input bit combining_rd_enable,
@@ -627,28 +755,28 @@ endgroup : cg_fe_egress_queue
   );
     option.per_instance = 1;
 
-    cp_fe_combine_direction: coverpoint path_is_write {
+    cp_fe_combine_direction: coverpoint path_is_write iff (!req_comb_snapshot_sample) {
       bins read  = {1'b0};
       bins write = {1'b1};
     }
 
-    cp_fe_combine_rd_enable: coverpoint combining_rd_enable {
+    cp_fe_combine_rd_enable: coverpoint combining_rd_enable iff (!req_comb_snapshot_sample) {
       bins disabled = {1'b0};
       bins enabled  = {1'b1};
     }
 
-    cp_fe_combine_wr_enable: coverpoint combining_wr_enable {
+    cp_fe_combine_wr_enable: coverpoint combining_wr_enable iff (!req_comb_snapshot_sample) {
       bins disabled = {1'b0};
       bins enabled  = {1'b1};
     }
 
     // pair_id encoding:
     //   0 = Req lanes 0-1, 1 = Req lanes 1-2, 2 = Req lanes 2-3,
-    //   3 = RwD lanes 0-1.
+    //   3 = Req lanes 3-0, 4 = RwD lanes 0-1, 5 = RwD lanes 1-0.
     // A pair is combinable only when both lanes are valid in the same sample,
     // the first address is 128 B aligned, and the second address is base+64 B.
     cp_fe_combine_valid_pair: coverpoint pair_id iff (
-      adjacent_pair_present &&
+      !req_comb_snapshot_sample && adjacent_pair_present &&
       first_hpa_128b_aligned &&
       addresses_contiguous
     ) {
@@ -660,17 +788,17 @@ endgroup : cg_fe_egress_queue
       bins rwd_1_0 = {3'd5};
     }
 
-    cp_fe_combine_pair_present: coverpoint adjacent_pair_present {
+    cp_fe_combine_pair_present: coverpoint adjacent_pair_present iff (!req_comb_snapshot_sample) {
       bins incomplete_pair = {1'b0};
       bins complete_pair   = {1'b1};
     }
 
-    cp_fe_combine_alignment: coverpoint first_hpa_128b_aligned {
+    cp_fe_combine_alignment: coverpoint first_hpa_128b_aligned iff (!req_comb_snapshot_sample) {
       bins unaligned = {1'b0};
       bins aligned   = {1'b1};
     }
 
-    cp_fe_combine_contiguous: coverpoint addresses_contiguous {
+    cp_fe_combine_contiguous: coverpoint addresses_contiguous iff (!req_comb_snapshot_sample) {
       bins noncontiguous = {1'b0};
       bins contiguous    = {1'b1};
     }
@@ -680,7 +808,7 @@ endgroup : cg_fe_egress_queue
     cp_fe_combine_violation: coverpoint {
       !addresses_contiguous,
       !first_hpa_128b_aligned
-    } iff (adjacent_pair_present) {
+    } iff (!req_comb_snapshot_sample && adjacent_pair_present) {
       bins addr_ne_base_plus_64b   = {2'b10};
       bins base_not_128b_aligned   = {2'b01};
       bins multi_violation         = {2'b11};
@@ -690,19 +818,19 @@ endgroup : cg_fe_egress_queue
     // The pair type fixes the architectural direction: Req is read and RwD
     // is write. Ignore the impossible pair/direction combinations.
     cr_fe_combine_dir: cross cp_fe_combine_valid_pair,
-                             cp_fe_combine_direction {
+                             cp_fe_combine_direction iff (!req_comb_snapshot_sample) {
       ignore_bins req_as_write =
-        binsof(cp_fe_combine_valid_pair) intersect {[3'd0:3'd2]} &&
+        binsof(cp_fe_combine_valid_pair) intersect {[3'd0:3'd3]} &&
         binsof(cp_fe_combine_direction) intersect {1'b1};
       ignore_bins rwd_as_read =
-        binsof(cp_fe_combine_valid_pair) intersect {3'd3} &&
+        binsof(cp_fe_combine_valid_pair) intersect {[3'd4:3'd5]} &&
         binsof(cp_fe_combine_direction) intersect {1'b0};
     }
 
     // Required independent-control cases. Both-enabled and both-disabled are
     // already covered by the individual enable coverpoints.
     cr_fe_combine_rd_wr_indep: cross cp_fe_combine_rd_enable,
-                                     cp_fe_combine_wr_enable {
+                                     cp_fe_combine_wr_enable iff (!req_comb_snapshot_sample) {
       bins rd_only =
         binsof(cp_fe_combine_rd_enable) intersect {1'b1} &&
         binsof(cp_fe_combine_wr_enable) intersect {1'b0};
@@ -720,7 +848,94 @@ endgroup : cg_fe_egress_queue
       //cp_fe_combine_enable,
       cp_fe_combine_pair_present,
       cp_fe_combine_alignment,
-      cp_fe_combine_contiguous;
+      cp_fe_combine_contiguous iff (!req_comb_snapshot_sample);
+
+    // Four-lane REQ order coverage. Values denote the FIRST valid packet.
+    cp_fe_req_start_channel: coverpoint req_cycle_start
+      iff (!path_is_write && req_comb_snapshot_sample) {
+      bins order_0123 = {0};
+      bins order_1230 = {1};
+      bins order_2301 = {2};
+      bins order_3012 = {3};
+    }
+
+    cp_fe_req_partial_to_start: coverpoint req_cycle_start
+      iff (!path_is_write && req_comb_snapshot_sample &&
+           req_partial_previous) {
+      bins next_start_ch0 = {0};
+      bins next_start_ch1 = {1};
+      bins next_start_ch2 = {2};
+      bins next_start_ch3 = {3};
+    }
+
+    // Pair-only points: sample together to avoid stale cross values.
+    cp_fe_req_order_for_pair: coverpoint req_cycle_start
+      iff (req_order_pair_sample && adjacent_pair_present &&
+           first_hpa_128b_aligned && addresses_contiguous &&
+           combining_rd_enable) {
+      bins starts[] = {[0:3]};
+    }
+    cp_fe_req_eligible_pair: coverpoint pair_id
+      iff (req_order_pair_sample && adjacent_pair_present &&
+           first_hpa_128b_aligned && addresses_contiguous &&
+           combining_rd_enable) {
+      bins req_0_1 = {0};
+      bins req_1_2 = {1};
+      bins req_2_3 = {2};
+      bins req_3_0 = {3};
+    }
+    cr_fe_req_order_x_eligible_pair: cross
+      cp_fe_req_order_for_pair, cp_fe_req_eligible_pair
+      iff (req_order_pair_sample && adjacent_pair_present &&
+           first_hpa_128b_aligned && addresses_contiguous &&
+           combining_rd_enable) {
+      // Exclude last-to-first, which is not consecutive in packet order.
+      ignore_bins end_to_start =
+        (binsof(cp_fe_req_order_for_pair) intersect {0} &&
+         binsof(cp_fe_req_eligible_pair) intersect {3}) ||
+        (binsof(cp_fe_req_order_for_pair) intersect {1} &&
+         binsof(cp_fe_req_eligible_pair) intersect {0}) ||
+        (binsof(cp_fe_req_order_for_pair) intersect {2} &&
+         binsof(cp_fe_req_eligible_pair) intersect {1}) ||
+        (binsof(cp_fe_req_order_for_pair) intersect {3} &&
+         binsof(cp_fe_req_eligible_pair) intersect {2});
+    }
+
+    cp_fe_rwd_start_channel: coverpoint rwd_cycle_start
+      iff (path_is_write && req_comb_snapshot_sample) {
+      bins order_01 = {0};
+      bins order_10 = {1};
+    }
+    cp_fe_rwd_partial_to_start: coverpoint rwd_cycle_start
+      iff (path_is_write && req_comb_snapshot_sample &&
+           rwd_partial_previous) {
+      bins next_start_ch0 = {0};
+      bins next_start_ch1 = {1};
+    }
+    cp_fe_rwd_order_for_pair: coverpoint rwd_cycle_start
+      iff (rwd_order_pair_sample && adjacent_pair_present &&
+           first_hpa_128b_aligned && addresses_contiguous &&
+           combining_wr_enable) {
+      bins starts[] = {[0:1]};
+    }
+    cp_fe_rwd_eligible_pair: coverpoint pair_id
+      iff (rwd_order_pair_sample && adjacent_pair_present &&
+           first_hpa_128b_aligned && addresses_contiguous &&
+           combining_wr_enable) {
+      bins rwd_0_1 = {4};
+      bins rwd_1_0 = {5};
+    }
+    cr_fe_rwd_order_x_eligible_pair: cross
+      cp_fe_rwd_order_for_pair, cp_fe_rwd_eligible_pair
+      iff (rwd_order_pair_sample && adjacent_pair_present &&
+           first_hpa_128b_aligned && addresses_contiguous &&
+           combining_wr_enable) {
+      ignore_bins reverse_order =
+        (binsof(cp_fe_rwd_order_for_pair) intersect {0} &&
+         binsof(cp_fe_rwd_eligible_pair) intersect {5}) ||
+        (binsof(cp_fe_rwd_order_for_pair) intersect {1} &&
+         binsof(cp_fe_rwd_eligible_pair) intersect {4});
+    }
   endgroup : cg_fe_cxl_parser_combining
 
   //--------------------------------------------------------------------------
@@ -956,6 +1171,9 @@ endgroup : cg_fe_tag_fifo
       bins startup     = (3'd0 => 3'd1 => 3'd2);
       bins mst_deinit  = (3'd2 => 3'd3 => 3'd0);
       bins slv_deinit  = (3'd2 => 3'd4 => 3'd0);
+      illegal_bins run_mst_deinit_init = (3'd2 => 3'd3 => 3'd1);
+      illegal_bins run_slv_deinit_init = (3'd2 => 3'd4 => 3'd1);
+
     }
 
     cp_fe_ingress_credit_fsm_state: coverpoint ingress_fsm_state
@@ -990,8 +1208,6 @@ endgroup : cg_fe_tag_fifo
 
     cp_fe_credit_overflow_src: coverpoint credit_overflow_src
       iff (overflow_sample_valid) {
-      bins m2s_req = {2'd0};
-      bins m2s_rwd = {2'd1};
       bins s2m_ndr = {2'd2};
       bins s2m_drs = {2'd3};
     }
@@ -1067,6 +1283,139 @@ endgroup : cg_fe_tag_fifo
       bins invalid_drs_parity = {2'b11};
     }
   endgroup : cg_fe_axi_requestor_parity
+
+  // Final error type supplied by the scoreboard coverage item.
+  covergroup cg_fe_axi_requestor_error with function sample(
+    input bit [1:0] error_resp_type
+  );
+    option.per_instance = 1;
+    cp_fe_err_response_type: coverpoint error_resp_type {
+      bins no_error               = {2'b00};
+      bins hdm_miss_err           = {2'b01};
+      bins cxl_parser_permission  = {2'b10};
+      bins tag_range_error        = {2'b11};
+    }
+  endgroup : cg_fe_axi_requestor_error
+
+    // Sample the local per-lane scoreboard error-response shadow.
+  covergroup cg_fe_hdm_decoder_rd with function sample(input hdm_cov_event_t e);
+    option.per_instance = 1;
+
+    cp_fe_error_response_type: coverpoint e.error_type iff (e.error_valid) {
+      bins no_error              = {2'b00};
+      bins hdm_miss_err          = {2'b01};
+      bins cxl_parser_permission = {2'b10};
+      bins tag_range_error       = {2'b11};
+    }
+
+    cp_fe_hdm_miss: coverpoint e.is_write
+      iff (e.error_valid && e.error_type == 2'b01) {
+      bins read = {1'b0};
+    }
+
+    cp_fe_dcd_permission_valid: coverpoint e.permission_valid iff (e.error_valid) {
+      bins not_checked = {1'b0};
+      bins checked     = {1'b1};
+    }
+
+    cp_fe_dcd_permission: coverpoint e.permission_passed iff (e.permission_valid) {
+      bins rd_ena0_read = {1'b0};
+      bins normal_read = {1'b1};
+    }
+
+    cp_fe_dcd_axi_id: coverpoint e.axi_id iff (e.axi_valid) {
+      bins read_id[4] = {[2'd0:2'd3]};
+    }
+
+    cp_fe_tag_range: coverpoint e.tag_range_passed
+      iff (e.packet_valid && e.tag_bounds_valid && e.tag_range_checked) {
+      bins tag_with_in_range = {1'b1};
+      bins tag_out_of_range  = {1'b0};
+    }
+
+    cp_fe_tag_check_enable: coverpoint e.tag_check_enabled iff (e.packet_valid) {
+      bins tag_check_enable  = {1'b1};
+      bins tag_check_disable = {1'b0};
+    }
+
+    // A skipped/disabled check has no valid pass/fail result. The enable
+    // coverpoint itself still covers disabled packets.
+    cr_fe_tagrange_x_en: cross cp_fe_tag_range, cp_fe_tag_check_enable {
+      ignore_bins check_disabled =
+        binsof(cp_fe_tag_check_enable.tag_check_disable);
+    }
+
+    // Sample once per matched 128B AXI request, using both original tags.
+    // Unchecked/default-zero tag results must never hit a failure bin.
+    cp_fe_tagrange_128b: coverpoint e.tag_pair_passed
+      iff (e.pair_sample_valid && e.axi_size == 8'd7 &&
+           (&e.tag_pair_checked) && (&e.tag_pair_bounds_valid)) {
+      bins both_pass     = {2'b11};
+      bins both_fail     = {2'b00};
+      bins t1pass_t2fail  = {2'b10};
+      bins t1fail_t2pass  = {2'b01};
+    }
+  endgroup : cg_fe_hdm_decoder_rd
+
+  covergroup cg_fe_hdm_decoder_wr with function sample(input hdm_cov_event_t e);
+    option.per_instance = 1;
+
+    cp_fe_error_response_type: coverpoint e.error_type iff (e.error_valid) {
+      bins no_error              = {2'b00};
+      bins hdm_miss_err          = {2'b01};
+      bins cxl_parser_permission = {2'b10};
+      bins tag_range_error       = {2'b11};
+    }
+
+    cp_fe_hdm_miss: coverpoint e.is_write
+      iff (e.error_valid && e.error_type == 2'b01) {
+      bins write = {1'b1};
+    }
+
+    cp_fe_dcd_permission_valid: coverpoint e.permission_valid iff (e.error_valid) {
+      bins not_checked = {1'b0};
+      bins checked     = {1'b1};
+    }
+
+    cp_fe_dcd_permission: coverpoint e.permission_passed iff (e.permission_valid) {
+      bins wr_ena0_write = {1'b0};
+      bins normal_write = {1'b1};
+    }
+
+    cp_fe_dcd_axi_id: coverpoint e.axi_id iff (e.axi_valid) {
+      bins write_id[4] = {[2'd0:2'd3]};
+    }
+
+    cp_fe_tag_range: coverpoint e.tag_range_passed
+      iff (e.packet_valid && e.tag_bounds_valid && e.tag_range_checked) {
+      bins tag_with_in_range = {1'b1};
+      bins tag_out_of_range  = {1'b0};
+    }
+
+    cp_fe_tag_check_enable: coverpoint e.tag_check_enabled iff (e.packet_valid) {
+      bins tag_check_enable  = {1'b1};
+      bins tag_check_disable = {1'b0};
+    }
+
+    // A skipped/disabled check has no valid pass/fail result. The enable
+    // coverpoint itself still covers disabled packets.
+    cr_fe_tagrange_x_en: cross cp_fe_tag_range, cp_fe_tag_check_enable {
+      ignore_bins check_disabled =
+        binsof(cp_fe_tag_check_enable.tag_check_disable);
+    }
+
+    // Sample once per matched 128B AXI request, using both original tags.
+    // Unchecked/default-zero tag results must never hit a failure bin.
+    cp_fe_tagrange_128b: coverpoint e.tag_pair_passed
+      iff (e.pair_sample_valid && e.axi_size == 8'd7 &&
+           (&e.tag_pair_checked) && (&e.tag_pair_bounds_valid)) {
+      bins both_pass     = {2'b11};
+      bins both_fail     = {2'b00};
+      bins t1pass_t2fail  = {2'b10};
+      bins t1fail_t2pass  = {2'b01};
+    }
+  endgroup : cg_fe_hdm_decoder_wr
+
 
   // -------------------------------------------------------------------------
   // AXI responder coverage
@@ -1224,6 +1573,13 @@ endgroup : cg_fe_tag_fifo
     int unsigned count
   );
   extern task sample_credit_counters_from_regblock();
+  extern task sample_scoreboard_items();
+  extern function void sample_hdm_event(input hdm_cov_event_t sample_data);
+  extern function void queue_hdm_tag(input bit is_write, input hdm_tag_result_t tag_result);
+  extern function void queue_hdm_axi(input bit is_write,
+                                   input bit [7:0] size, input bit [7:0] len);
+  extern function void sample_pending_hdm_pairs(input bit is_write);
+  extern function void reset_hdm_tag_queues();
 
 endclass : kb_fwd_eng_coverage
 
@@ -1235,6 +1591,9 @@ function kb_fwd_eng_coverage::new(
 
   //SB to Coverage fifo
   cov_fifo         = new("cov_fifo", this);
+
+  //Coverage sequence item handle
+  h_cov_seq_items = kb_fwd_eng_cov_seq_item::type_id::create("h_cov_seq_items");
 
   //apb_fifo
   apb_fifo         = new("h_apb_fifo", this);
@@ -1258,7 +1617,10 @@ function kb_fwd_eng_coverage::new(
   cg_fe_credit_manager                 = new();
   cg_fe_axi_requestor_aw                 = new();
   cg_fe_axi_requestor_w                  = new();
-  cg_fe_axi_requestor_parity             = new();
+  cg_fe_axi_requestor_parity      = new();
+  cg_fe_axi_requestor_error       = new();
+  cg_fe_hdm_decoder_rd            = new();
+  cg_fe_hdm_decoder_wr            = new();
   cg_fe_axi_responder                    = new();
   cg_fe_error_interrupt                  = new();
   cg_fe_axi_requestor_ar                 = new();
@@ -1287,11 +1649,18 @@ function void kb_fwd_eng_coverage::build_phase(uvm_phase phase);
 endfunction : build_phase
 
 function void kb_fwd_eng_coverage::reset_config_shadow();
+  reset_hdm_tag_queues();
+  req_order_known = 1'b0;
+  rwd_order_known = 1'b0;
+  req_comb_snapshot_sample = 1'b0;
+  req_order_pair_sample = 1'b0;
+  rwd_order_pair_sample = 1'b0;
   flit_mode_inst                       = 1'b1;
   combining_rd_enable_inst             = 1'b1;
   combining_wr_enable_inst             = 1'b1;
   unsupported_opcode_check_enable_inst = 1'b1;
   unsupported_field_check_enable_inst  = 1'b1;
+  tag_range_check                     = 1'b0;
   poison_crc_invert_enable_inst        = 1'b1;
   fe_error_status_inst                 = '0;
   fe_error_status_prev                 = '0;
@@ -1310,6 +1679,7 @@ task kb_fwd_eng_coverage::run_phase(uvm_phase phase);
     apb();
     cxl_configure();
     axi_configure();
+    sample_scoreboard_items();
   join_none
 endtask : run_phase
 
@@ -1344,6 +1714,10 @@ task kb_fwd_eng_coverage::cxl_configure();
         cg_fe_apb_registers.sample();
         reset_seen = 1'b1;
       end
+      // Synchronize rotation pointers on reset; both helpers return without
+      // sampling packet or combining coverpoints while rst_n is low.
+      sample_req_inputs(h_cxl_m2s_items);
+      sample_rwd_inputs(h_cxl_m2s_items);
       continue;
     end
 
@@ -1544,9 +1918,19 @@ function void kb_fwd_eng_coverage::sample_req_inputs(
   kb_cxl_m2s_snap snap
 );
   int unsigned max_req_lanes;
+  bit [3:0] current_mask;
+  int unsigned ordered_lanes[4];
+  int unsigned packet_count;
+  int unsigned lane_base;
 
   // rst_n is active low. Discard partial gap history while reset is asserted.
+  req_comb_snapshot_sample = 1'b0;
   if (!snap.rst_n) begin
+    req_order_known = 1'b1;
+    req_next_lane = 0;
+    req_previous_count = 0;
+    req_previous_four_lane = 1'b0;
+    req_order_pair_sample = 1'b0;
     foreach (req_seen_valid[i]) begin
       req_seen_valid[i] = 1'b0;
       req_gap_cycles[i] = 0;
@@ -1555,6 +1939,13 @@ function void kb_fwd_eng_coverage::sample_req_inputs(
   end
 
   max_req_lanes = flit_mode_inst ? 4 : 2;
+
+  // Build the full current-cycle valid vector before any per-lane sampling.
+  current_mask = '0;
+  for (int i = 0; i < KB_CXL_MAX_NUM_REQ; i++) begin
+    req_valid[i] = (i < max_req_lanes) ? snap.req_items[i].valid : 1'b0;
+    if (i < 4) current_mask[i] = req_valid[i];
+  end
 
   for (int i = 0; i < max_req_lanes; i++) begin
     bit gap_available;
@@ -1618,35 +2009,64 @@ function void kb_fwd_eng_coverage::sample_req_inputs(
     req_gap_cycles[i] = 0;
   end
 
-  // Sample each adjacent pair that can be presented in the active flit mode.
-  for (int i = 0; i < (max_req_lanes - 1); i++) begin
-    bit pair_present;
-    bit aligned;
-    bit contiguous;
-
-    pair_present = snap.req_items[i].valid &&
-                   snap.req_items[i+1].valid;
-                   
-    // Evaluate alignment and contiguity using the local arrays when both are valid
-    if (pair_present) begin
-      aligned    = !req_hpa[i][0];
-      contiguous = (req_hpa[i+1] == (req_hpa[i] + 1'b1));
-    end else begin
-      aligned    = 1'b0;
-      contiguous = 1'b0;
+  // The driver starts at req_lane_ptr % num_req, skips credit-starved
+  // lanes, and advances its pointer after each actual packet.
+  if (req_order_known) begin
+    lane_base = req_next_lane % max_req_lanes;
+    packet_count = 0;
+    for (int k = 0; k < max_req_lanes; k++) begin
+      int unsigned lane;
+      lane = (lane_base + k) % max_req_lanes;
+      if (current_mask[lane]) begin
+        ordered_lanes[packet_count] = lane;
+        packet_count++;
+        req_next_lane = (lane + 1) % max_req_lanes;
+      end
     end
 
-    if (snap.req_items[i].valid || snap.req_items[i+1].valid) begin
-      cg_fe_cxl_parser_combining.sample(
-        1'b0,
-        combining_rd_enable_inst,
-        combining_wr_enable_inst,
-        i,
-        pair_present,
-        aligned,
-        contiguous
-      );
+    if (packet_count != 0) begin
+      req_cycle_start = ordered_lanes[0];
+      req_partial_previous = req_previous_four_lane &&
+                             req_previous_count inside {[1:3]};
+
+      // Exactly one order sample per nonempty four-lane REQ snapshot.
+      // Legacy points are gated off for this bookkeeping call.
+      if (max_req_lanes == 4) begin
+        req_comb_snapshot_sample = 1'b1;
+        cg_fe_cxl_parser_combining.sample(
+          1'b0, combining_rd_enable_inst, combining_wr_enable_inst,
+          3'd0, 1'b0, 1'b0, 1'b0);
+        req_comb_snapshot_sample = 1'b0;
+      end
+
+      // Visit physical adjacent pairs in order, but never last -> first.
+      // Invalid lanes remain visible to the existing incomplete-pair bins.
+      for (int k = 0; k < max_req_lanes - 1; k++) begin
+        int unsigned i;
+        int unsigned j;
+        bit pair_present;
+        bit aligned;
+        bit contiguous;
+        i = (req_cycle_start + k) % max_req_lanes;
+        j = (i + 1) % max_req_lanes;
+        // Existing 68B plan contains only Req 0->1.
+        if (max_req_lanes == 2 && i != 0) continue;
+        pair_present = current_mask[i] && current_mask[j];
+        aligned = pair_present && !snap.req_items[i].hpa[0];
+        contiguous = pair_present &&
+          (snap.req_items[j].hpa == (snap.req_items[i].hpa + 46'd1));
+
+        req_order_pair_sample = (max_req_lanes == 4);
+        if (current_mask[i] || current_mask[j])
+          cg_fe_cxl_parser_combining.sample(
+            1'b0, combining_rd_enable_inst, combining_wr_enable_inst,
+            i, pair_present, aligned, contiguous);
+        req_order_pair_sample = 1'b0;
+      end
     end
+    // Idle snapshots break the "immediately previous cycle was partial" test.
+    req_previous_count = packet_count;
+    req_previous_four_lane = (max_req_lanes == 4);
   end
 endfunction : sample_req_inputs
 
@@ -1654,10 +2074,17 @@ function void kb_fwd_eng_coverage::sample_rwd_inputs(
   kb_cxl_m2s_snap snap
 );
   int unsigned max_rwd_lanes;
+  int unsigned packet_count;
+  int unsigned lane_base;
 
   // rst_n is active low. Discard partial gap history while reset is asserted.
+  rwd_order_pair_sample = 1'b0;
   if (!snap.rst_n) begin
-    foreach (req_seen_valid[i]) begin
+    rwd_order_known = 1'b1;
+    rwd_next_lane = 0;
+    rwd_previous_count = 0;
+    rwd_previous_two_lane = 1'b0;
+    foreach (rwd_seen_valid[i]) begin
       rwd_seen_valid[i] = 1'b0;
       rwd_gap_cycles[i] = 0;
     end
@@ -1665,6 +2092,9 @@ function void kb_fwd_eng_coverage::sample_rwd_inputs(
   end
 
   max_rwd_lanes = flit_mode_inst ? 2 : 1;
+
+  for (int i = 0; i < KB_CXL_MAX_NUM_RWD; i++)
+    rwd_valid[i] = (i < max_rwd_lanes) ? snap.rwd_items[i].valid : 1'b0;
 
   for (int i = 0; i < KB_CXL_MAX_NUM_RWD; i++) begin
 
@@ -1675,7 +2105,7 @@ function void kb_fwd_eng_coverage::sample_rwd_inputs(
     rwd_gap_available = 1'b0;
     rwd_gap_class = 0;
 
-    if (snap.rwd_items[i].valid) begin
+    if (rwd_valid[i]) begin
       cg_fe_axi_requestor_parity.sample(
         1'b0, 1'b1, calculate_rwd_parity_error(snap, i)
       );
@@ -1721,34 +2151,50 @@ function void kb_fwd_eng_coverage::sample_rwd_inputs(
     end
   end
 
-  if (max_rwd_lanes == 2) begin
-    bit pair_present;
-    bit aligned;
-    bit contiguous;
-
-    pair_present = snap.rwd_items[0].valid &&
-                   snap.rwd_items[1].valid;
-                   
-    // Evaluate alignment and contiguity using the local arrays when both are valid
-    if (pair_present) begin
-      aligned    = !rwd_hpa[0][0];
-      contiguous = (rwd_hpa[1] == (rwd_hpa[0] + 1'b1));
-    end else begin
-      aligned    = 1'b0;
-      contiguous = 1'b0;
+  if (rwd_order_known) begin
+    packet_count = 0;
+    lane_base = rwd_next_lane % max_rwd_lanes;
+    for (int k = 0; k < max_rwd_lanes; k++) begin
+      int unsigned lane;
+      lane = (lane_base + k) % max_rwd_lanes;
+      if (rwd_valid[lane]) begin
+        if (packet_count == 0) rwd_cycle_start = lane;
+        packet_count++;
+        rwd_next_lane = (lane + 1) % max_rwd_lanes;
+      end
     end
 
-    if (snap.rwd_items[0].valid || snap.rwd_items[1].valid) begin
+    if (max_rwd_lanes == 2 && packet_count != 0) begin
+      int unsigned i;
+      int unsigned j;
+      bit pair_present;
+      bit aligned;
+      bit contiguous;
+
+      rwd_partial_previous = rwd_previous_two_lane &&
+                             (rwd_previous_count == 1);
+      // Bookkeeping sample, gated out of all legacy pair coverpoints.
+      req_comb_snapshot_sample = 1'b1;
       cg_fe_cxl_parser_combining.sample(
-        1'b1,
-        combining_rd_enable_inst,
-        combining_wr_enable_inst,
-        3'd3,
-        pair_present,
-        aligned,
-        contiguous
-      );
+        1'b1, combining_rd_enable_inst, combining_wr_enable_inst,
+        3'd4, 1'b0, 1'b0, 1'b0);
+      req_comb_snapshot_sample = 1'b0;
+
+      i = rwd_cycle_start;
+      j = (i + 1) % 2;
+      pair_present = rwd_valid[i] && rwd_valid[j];
+      aligned = pair_present && !snap.rwd_items[i].hpa[0];
+      contiguous = pair_present &&
+        (snap.rwd_items[j].hpa == (snap.rwd_items[i].hpa + 46'd1));
+      // Only first -> second in THIS snapshot; never previous-cycle HPA.
+      rwd_order_pair_sample = 1'b1;
+      cg_fe_cxl_parser_combining.sample(
+        1'b1, combining_rd_enable_inst, combining_wr_enable_inst,
+        (i == 0) ? 3'd4 : 3'd5, pair_present, aligned, contiguous);
+      rwd_order_pair_sample = 1'b0;
     end
+    rwd_previous_count = packet_count;
+    rwd_previous_two_lane = (max_rwd_lanes == 2);
   end
 endfunction : sample_rwd_inputs
 /*
@@ -2008,9 +2454,13 @@ task kb_fwd_eng_coverage::apb_configure(
 
   if (txn.Direction == DENALI_CDN_APB_DIRECTION_READ) begin
     case (txn.Addr)
-      'h81020: begin // Read-only DevLoad bands: WR[3:2], RD[1:0]
-        cg_fe_egress_queue.sample(txn.Data[3:2], txn.Data[1:0]);
-      end
+      'h81020: begin
+      write_egress_queue_devload = txn.Data[3:2];
+      read_egress_queue_devload  = txn.Data[1:0];
+
+      cg_fe_egress_queue.sample();
+    end
+
       'h80a00: begin // fe_error_status: 20 bits, read-clear
         sample_error_interrupt(txn.Data[19:0]);
         cg_fe_apb_registers.sample();
@@ -2058,6 +2508,8 @@ task kb_fwd_eng_coverage::apb_configure(
   end
 
   case (txn.Addr)
+    'h80100: tag_range_check = txn.Data[0]; // dcd_control.tag_enable
+
     'h80500: begin // cxl_parser_control
       flit_mode_inst           = txn.Data[0];
       combining_rd_enable_inst = txn.Data[1];
@@ -2120,6 +2572,13 @@ function void kb_fwd_eng_coverage::convert_to_aw(kb_axi4_vendor_txn_t txn);
     
     cg_fe_axi_requestor_aw.sample();
 
+    hdm_sample = '0;
+    hdm_sample.axi_valid = 1'b1;
+    hdm_sample.is_write  = 1'b1;
+    hdm_sample.axi_id    = aw.id[1:0];
+    sample_hdm_event(hdm_sample);
+    queue_hdm_axi(1'b1, aw.size, aw.len);
+
     //For aw_id covergroup
     cg_fe_tag_fifo.sample(1'b1, txn.IdTag);
   end
@@ -2139,6 +2598,13 @@ function void kb_fwd_eng_coverage::convert_to_ar(kb_axi4_vendor_txn_t txn);
     end
     
     cg_fe_axi_requestor_ar.sample();
+
+    hdm_sample = '0;
+    hdm_sample.axi_valid = 1'b1;
+    hdm_sample.is_write  = 1'b0;
+    hdm_sample.axi_id    = ar.id[1:0];
+    sample_hdm_event(hdm_sample);
+    queue_hdm_axi(1'b0, ar.size, ar.len);
 
     //For ar_id covergrop
     cg_fe_tag_fifo.sample(1'b0, txn.IdTag);
@@ -2211,14 +2677,181 @@ function void kb_fwd_eng_coverage::convert_to_r(kb_axi4_vendor_txn_t txn);
   end
 endfunction : convert_to_r
 
+// Route each event to exactly one direction's embedded covergroup.
+function void kb_fwd_eng_coverage::sample_hdm_event(input hdm_cov_event_t sample_data);
+  if (reset_seen) return;
+  if (sample_data.is_write)
+    cg_fe_hdm_decoder_wr.sample(sample_data);
+  else
+    cg_fe_hdm_decoder_rd.sample(sample_data);
+endfunction : sample_hdm_event
+
+function void kb_fwd_eng_coverage::reset_hdm_tag_queues();
+  hdm_rd_tag_q.delete();
+  hdm_wr_tag_q.delete();
+  hdm_rd_axi_q.delete();
+  hdm_wr_axi_q.delete();
+  hdm_rd_pairing_blocked = 1'b0;
+  hdm_wr_pairing_blocked = 1'b0;
+endfunction : reset_hdm_tag_queues
+
+function void kb_fwd_eng_coverage::queue_hdm_tag(
+  input bit is_write,
+  input hdm_tag_result_t tag_result
+);
+  if (reset_seen) return;
+  if (is_write) begin
+    if (hdm_wr_pairing_blocked) return;
+    hdm_wr_tag_q.push_back(tag_result);
+  end else begin
+    if (hdm_rd_pairing_blocked) return;
+    hdm_rd_tag_q.push_back(tag_result);
+  end
+  sample_pending_hdm_pairs(is_write);
+endfunction : queue_hdm_tag
+
+function void kb_fwd_eng_coverage::queue_hdm_axi(
+  input bit is_write,
+  input bit [7:0] size,
+  input bit [7:0] len
+);
+  hdm_axi_size_t observation;
+
+  if (reset_seen) return;
+  if ((is_write && hdm_wr_pairing_blocked) ||
+      (!is_write && hdm_rd_pairing_blocked)) return;
+
+  // Existing FE monitor conversion normalizes txn.Size to AXI AxSIZE.
+  // Do not treat other sizes or multi-beat bursts as a single 64B packet.
+  if ((len != 8'd0) || !(size inside {8'd6, 8'd7})) begin
+    if (is_write) begin
+      hdm_wr_pairing_blocked = 1'b1;
+      hdm_wr_tag_q.delete();
+      hdm_wr_axi_q.delete();
+    end else begin
+      hdm_rd_pairing_blocked = 1'b1;
+      hdm_rd_tag_q.delete();
+      hdm_rd_axi_q.delete();
+    end
+    `uvm_error("HDM_TAG_AXI_FORMAT", $sformatf(
+      "Unsupported AXI format: write=%0b size=%0d len=%0d; tag pairing for this direction is disabled until reset",
+      is_write, size, len))
+    return;
+  end
+
+  observation.size = size;
+  observation.len  = len;
+  if (is_write) hdm_wr_axi_q.push_back(observation);
+  else          hdm_rd_axi_q.push_back(observation);
+  sample_pending_hdm_pairs(is_write);
+endfunction : queue_hdm_axi
+
+function void kb_fwd_eng_coverage::sample_pending_hdm_pairs(input bit is_write);
+  hdm_axi_size_t observation;
+  hdm_tag_result_t tag1;
+  hdm_tag_result_t tag2;
+  hdm_cov_event_t pair_sample;
+  int unsigned required_tags;
+
+  if (reset_seen) return;
+  if ((is_write && hdm_wr_pairing_blocked) ||
+      (!is_write && hdm_rd_pairing_blocked)) return;
+
+  forever begin
+    tag2 = '0;
+    if (is_write) begin
+      if (hdm_wr_axi_q.size() == 0) return;
+      observation = hdm_wr_axi_q[0];
+      required_tags = (observation.size == 8'd7) ? 2 : 1;
+      // Leave BOTH queues untouched until a complete match is available.
+      if (hdm_wr_tag_q.size() < required_tags) return;
+      observation = hdm_wr_axi_q.pop_front();
+      tag1 = hdm_wr_tag_q.pop_front();
+      if (required_tags == 2) tag2 = hdm_wr_tag_q.pop_front();
+    end else begin
+      if (hdm_rd_axi_q.size() == 0) return;
+      observation = hdm_rd_axi_q[0];
+      required_tags = (observation.size == 8'd7) ? 2 : 1;
+      if (hdm_rd_tag_q.size() < required_tags) return;
+      observation = hdm_rd_axi_q.pop_front();
+      tag1 = hdm_rd_tag_q.pop_front();
+      if (required_tags == 2) tag2 = hdm_rd_tag_q.pop_front();
+    end
+
+    // 64B consumes one result to maintain alignment, without a pair sample.
+    if (required_tags == 2) begin
+      pair_sample = '0;
+      pair_sample.is_write = is_write;
+      pair_sample.pair_sample_valid = 1'b1;
+      pair_sample.axi_size = observation.size;
+      pair_sample.tag_pair_checked = {tag1.tag_range_checked, tag2.tag_range_checked};
+      pair_sample.tag_pair_bounds_valid = {tag1.tag_bounds_valid, tag2.tag_bounds_valid};
+      pair_sample.tag_pair_passed = {tag1.tag_range_passed, tag2.tag_range_passed};
+      // Other event flags remain zero: only cp_fe_tagrange_128b may hit.
+      sample_hdm_event(pair_sample);
+    end
+  end
+endfunction : sample_pending_hdm_pairs
+
+task kb_fwd_eng_coverage::sample_scoreboard_items();
+  kb_fwd_eng_cov_seq_item h_txn;
+
+  forever begin
+    cov_fifo.get(h_txn);
+    if (reset_seen) continue;
+    tag_bounds_valid  = h_txn.tag_bounds_valid;
+    tag_range_checked = h_txn.tag_range_checked;
+    tag_range_passed  = h_txn.tag_range_passed;
+    
+    foreach (h_txn.error_resp_type[i]) begin
+      err_resp_type[i] = h_txn.error_resp_type[i];
+      if (h_txn.valid_lanes[i]) begin
+        hdm_sample = '0;
+        hdm_sample.error_valid       = 1'b1;
+        hdm_sample.packet_valid      = 1'b1;
+        hdm_sample.tag_bounds_valid  = tag_bounds_valid[i];
+        hdm_sample.tag_check_enabled = tag_range_check;
+        hdm_sample.tag_range_checked = tag_range_checked[i];
+        hdm_sample.tag_range_passed  = tag_range_passed[i];
+        hdm_sample.error_type        = err_resp_type[i];
+        hdm_sample.is_write          = h_txn.is_write;
+        hdm_sample.permission_valid  = h_txn.permission_checked[i];
+        hdm_sample.permission_passed = h_txn.permission_passed[i];
+        sample_hdm_event(hdm_sample);
+        // Publisher contract: valid entries in this iteration order are in
+        // AXI request order within this direction. A merged request supplies
+        // two consecutive original-tag entries, each with its own result.
+        // Enqueue even if checking was skipped: every packet occupies a slot.
+        queue_hdm_tag(h_txn.is_write, '{
+          tag_bounds_valid: tag_bounds_valid[i],
+          tag_range_checked: tag_range_checked[i],
+          tag_range_passed: tag_range_passed[i]
+        });
+        cg_fe_axi_requestor_error.sample(h_txn.error_resp_type[i]);
+      end
+    end
+
+  end
+endtask : sample_scoreboard_items
+
 
 function void kb_fwd_eng_coverage::report_phase(uvm_phase phase);
   super.report_phase(phase);
 
   `uvm_info(get_type_name(), "===== FE INPUT COVERAGE SUMMARY =====", UVM_LOW)
+  `uvm_info(get_type_name(), $sformatf("  HDM Read Decoder Cov  : %0.2f%%", cg_fe_hdm_decoder_rd.get_coverage()), UVM_LOW)
+  `uvm_info(get_type_name(), $sformatf("  HDM Write Decoder Cov : %0.2f%%", cg_fe_hdm_decoder_wr.get_coverage()), UVM_LOW)
+  if (hdm_rd_tag_q.size() || hdm_rd_axi_q.size() ||
+      hdm_wr_tag_q.size() || hdm_wr_axi_q.size()) begin
+    `uvm_warning("HDM_TAG_PENDING", $sformatf(
+      "Unmatched HDM entries at end of test: read tags=%0d AXI=%0d; write tags=%0d AXI=%0d",
+      hdm_rd_tag_q.size(), hdm_rd_axi_q.size(),
+      hdm_wr_tag_q.size(), hdm_wr_axi_q.size()))
+  end
   `uvm_info(get_type_name(), $sformatf("  REQ Input Coverage     : %0.2f%%", cg_fe_cxl_parser_req.get_coverage()), UVM_LOW)
   `uvm_info(get_type_name(), $sformatf("  RWD Input Coverage     : %0.2f%%", cg_fe_cxl_parser_rwd.get_coverage()), UVM_LOW)
   `uvm_info(get_type_name(), $sformatf("  CXL Parity Coverage    : %0.2f%%", cg_fe_axi_requestor_parity.get_coverage()), UVM_LOW)
+  `uvm_info(get_type_name(), $sformatf("  Scoreboard Error Cov   : %0.2f%%", cg_fe_axi_requestor_error.get_coverage()), UVM_LOW)
   `uvm_info(get_type_name(), $sformatf("  Combining Coverage     : %0.2f%%", cg_fe_cxl_parser_combining.get_coverage()), UVM_LOW)
   `uvm_info(get_type_name(), $sformatf("  AXI Responder Coverage : %0.2f%%", cg_fe_axi_responder.get_coverage()), UVM_LOW)
   `uvm_info(get_type_name(), $sformatf("  Error/IRQ Coverage     : %0.2f%%", cg_fe_error_interrupt.get_coverage()), UVM_LOW)
@@ -2228,3 +2861,5 @@ function void kb_fwd_eng_coverage::report_phase(uvm_phase phase);
 endfunction : report_phase
 
 `endif // KB_FWD_ENG_COVERAGE_SV
+
+
