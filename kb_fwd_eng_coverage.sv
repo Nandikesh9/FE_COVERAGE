@@ -171,6 +171,19 @@ class kb_fwd_eng_coverage extends uvm_component;
   bit [23:0] reg_hpa_top[10];
   bit [23:0] reg_dpa_base[10];
 
+  // Bounded queues with exactly ten entries, initialized on reset.
+  // Entry i always belongs to region i; these queues are never popped.
+  // Each entry holds {region_msb[31:0], region_lsb[31:0]}.
+  bit [63:0] hdm_rd_region_count_q[$:9];
+  bit [63:0] hdm_wr_region_count_q[$:9];
+
+  // Last observed ECC counter values, indexed AW LSB/MSB, AR LSB/MSB.
+  bit [31:0] dcd_sec_count_prev[4];
+  bit [31:0] dcd_ded_count_prev[4];
+  bit        dcd_sec_count_seen[4];
+  bit        dcd_ded_count_seen[4];
+
+
   // Tracker variables to allow unified sampling in cg_fe_apb_registers
   bit        is_hdm_update;
   int        current_hdm_idx;
@@ -198,6 +211,10 @@ class kb_fwd_eng_coverage extends uvm_component;
   // Egress Queue Local Variables
   logic [1:0] write_egress_queue_devload;
   logic [1:0] read_egress_queue_devload;
+  bit write_backpressure_seen;
+  bit read_backpressure_seen;
+  bit [1:0] write_fill_class_prev;
+  bit [1:0] read_fill_class_prev;
 
   //Scoreboard variables
   // Each sampling source enables only the fields it actually observes.
@@ -209,11 +226,21 @@ class kb_fwd_eng_coverage extends uvm_component;
     bit tag_range_checked;
     bit tag_range_passed;
     bit [1:0] error_type;
+    bit nxm_enabled;
+    bit poison_enabled;
     bit is_write;
     bit permission_valid;
     bit permission_passed;
     bit axi_valid;
     bit [1:0] axi_id;
+    bit region_sample_valid;
+    bit [3:0] region_index;
+    bit boundary_sample_valid;
+    bit [1:0] boundary_class;
+    bit ecc_sec_sample_valid;
+    bit ecc_ded_sample_valid;
+    bit ecc_half_msb;
+    bit ecc_found;
     // Pair events are separate from the per-lane and AXI-ID samples.
     bit pair_sample_valid;
     bit [7:0] axi_size;
@@ -503,11 +530,17 @@ class kb_fwd_eng_coverage extends uvm_component;
   //--------------------------------------------------------------------------
   // Egress_Queue Coverage
   //--------------------------------------------------------------------------
-covergroup cg_fe_egress_queue;
+covergroup cg_fe_egress_queue with function sample(
+  input bit devload_sample_valid,
+  input bit write_fill_sample_valid,
+  input bit read_fill_sample_valid,
+  input bit [7:0] write_fill_level,
+  input bit [7:0] read_fill_level
+);
   option.per_instance = 1;
 
   cp_fe_write_egress_queue_devload:
-    coverpoint write_egress_queue_devload {
+    coverpoint write_egress_queue_devload iff (devload_sample_valid) {
       bins light        = {2'b00};
       bins optimal      = {2'b01};
       bins mod_overload = {2'b10};
@@ -515,12 +548,28 @@ covergroup cg_fe_egress_queue;
     }
 
   cp_fe_read_egress_queue_devload:
-    coverpoint read_egress_queue_devload {
+    coverpoint read_egress_queue_devload iff (devload_sample_valid) {
       bins light        = {2'b00};
       bins optimal      = {2'b01};
       bins mod_overload = {2'b10};
       bins severe       = {2'b11};
     }
+
+  cp_fe_write_backpressure: coverpoint write_fill_level
+    iff (write_fill_sample_valid) {
+    bins empty = {8'd0};
+    bins low_fill = {[8'd1:8'd32]};
+    bins high_fill = {[8'd33:8'd63]};
+    bins egress_backpressure_applied = {[8'd64:8'hff]};
+  }
+
+  cp_fe_read_backpressure: coverpoint read_fill_level
+    iff (read_fill_sample_valid) {
+    bins empty = {8'd0};
+    bins low_fill = {[8'd1:8'd32]};
+    bins high_fill = {[8'd33:8'd63]};
+    bins egress_backpressure_applied = {[8'd64:8'hff]};
+  }
 
 endgroup : cg_fe_egress_queue
 
@@ -1301,6 +1350,44 @@ endgroup : cg_fe_tag_fifo
   covergroup cg_fe_hdm_decoder_rd with function sample(input hdm_cov_event_t e);
     option.per_instance = 1;
 
+    cp_fe_dcd_ecc_sec: coverpoint {e.ecc_half_msb, e.ecc_found}
+      iff (e.ecc_sec_sample_valid) {
+      bins ar_lsb_sec_not_found = {2'b00};
+      bins ar_lsb_sec_found     = {2'b01};
+      bins ar_msb_sec_not_found = {2'b10};
+      bins ar_msb_sec_found     = {2'b11};
+    }
+
+    cp_fe_dcd_ecc_ded: coverpoint {e.ecc_half_msb, e.ecc_found}
+      iff (e.ecc_ded_sample_valid) {
+      bins ar_lsb_ded_not_found = {2'b00};
+      bins ar_lsb_ded_found     = {2'b01};
+      bins ar_msb_ded_not_found = {2'b10};
+      bins ar_msb_ded_found     = {2'b11};
+    }
+
+    // A dedicated counter sample enables only this region coverpoint.
+    cp_fe_hdm_region_match: coverpoint e.region_index iff (e.region_sample_valid) {
+      bins hdm_region_0_hit = {4'd0};
+      bins hdm_region_1_hit = {4'd1};
+      bins hdm_region_2_hit = {4'd2};
+      bins hdm_region_3_hit = {4'd3};
+      bins hdm_region_4_hit = {4'd4};
+      bins hdm_region_5_hit = {4'd5};
+      bins hdm_region_6_hit = {4'd6};
+      bins hdm_region_7_hit = {4'd7};
+      bins hdm_region_8_hit = {4'd8};
+      bins hdm_region_9_hit = {4'd9};
+    }
+
+    cp_fe_hdm_boundary: coverpoint e.boundary_class
+      iff (e.boundary_sample_valid) {
+      bins hpa_base_include = {2'd0};
+      bins hpa_between_base_and_top_minus_1 = {2'd1};
+      bins hpa_top_minus_1 = {2'd2};
+      bins hpa_top_excluded = {2'd3};
+    }
+
     cp_fe_error_response_type: coverpoint e.error_type iff (e.error_valid) {
       bins no_error              = {2'b00};
       bins hdm_miss_err          = {2'b01};
@@ -1312,6 +1399,21 @@ endgroup : cg_fe_tag_fifo
       iff (e.error_valid && e.error_type == 2'b01) {
       bins read = {1'b0};
     }
+
+    cp_fe_hdm_miss_nxm_enable: coverpoint e.nxm_enabled
+      iff (e.error_valid && e.error_type == 2'b01) {
+      bins apb_nxm_disabled = {1'b0};
+      bins apb_nxm_enabled  = {1'b1};
+    }
+
+    cp_fe_hdm_miss_poison_enable: coverpoint e.poison_enabled
+      iff (e.error_valid && e.error_type == 2'b01) {
+      bins apb_poison_disabled = {1'b0};
+      bins apb_poison_enabled  = {1'b1};
+    }
+
+    cr_fe_hdm_miss_x_nxm_x_poison: cross cp_fe_hdm_miss,
+      cp_fe_hdm_miss_nxm_enable, cp_fe_hdm_miss_poison_enable;
 
     cp_fe_dcd_permission_valid: coverpoint e.permission_valid iff (e.error_valid) {
       bins not_checked = {1'b0};
@@ -1360,6 +1462,44 @@ endgroup : cg_fe_tag_fifo
   covergroup cg_fe_hdm_decoder_wr with function sample(input hdm_cov_event_t e);
     option.per_instance = 1;
 
+    cp_fe_dcd_ecc_sec: coverpoint {e.ecc_half_msb, e.ecc_found}
+      iff (e.ecc_sec_sample_valid) {
+      bins aw_lsb_sec_not_found = {2'b00};
+      bins aw_lsb_sec_found     = {2'b01};
+      bins aw_msb_sec_not_found = {2'b10};
+      bins aw_msb_sec_found     = {2'b11};
+    }
+
+    cp_fe_dcd_ecc_ded: coverpoint {e.ecc_half_msb, e.ecc_found}
+      iff (e.ecc_ded_sample_valid) {
+      bins aw_lsb_ded_not_found = {2'b00};
+      bins aw_lsb_ded_found     = {2'b01};
+      bins aw_msb_ded_not_found = {2'b10};
+      bins aw_msb_ded_found     = {2'b11};
+    }
+
+    // A dedicated counter sample enables only this region coverpoint.
+    cp_fe_hdm_region_match: coverpoint e.region_index iff (e.region_sample_valid) {
+      bins hdm_region_0_hit = {4'd0};
+      bins hdm_region_1_hit = {4'd1};
+      bins hdm_region_2_hit = {4'd2};
+      bins hdm_region_3_hit = {4'd3};
+      bins hdm_region_4_hit = {4'd4};
+      bins hdm_region_5_hit = {4'd5};
+      bins hdm_region_6_hit = {4'd6};
+      bins hdm_region_7_hit = {4'd7};
+      bins hdm_region_8_hit = {4'd8};
+      bins hdm_region_9_hit = {4'd9};
+    }
+
+    cp_fe_hdm_boundary: coverpoint e.boundary_class
+      iff (e.boundary_sample_valid) {
+      bins hpa_base_include = {2'd0};
+      bins hpa_between_base_and_top_minus_1 = {2'd1};
+      bins hpa_top_minus_1 = {2'd2};
+      bins hpa_top_excluded = {2'd3};
+    }
+
     cp_fe_error_response_type: coverpoint e.error_type iff (e.error_valid) {
       bins no_error              = {2'b00};
       bins hdm_miss_err          = {2'b01};
@@ -1371,6 +1511,21 @@ endgroup : cg_fe_tag_fifo
       iff (e.error_valid && e.error_type == 2'b01) {
       bins write = {1'b1};
     }
+
+    cp_fe_hdm_miss_nxm_enable: coverpoint e.nxm_enabled
+      iff (e.error_valid && e.error_type == 2'b01) {
+      bins apb_nxm_disabled = {1'b0};
+      bins apb_nxm_enabled  = {1'b1};
+    }
+
+    cp_fe_hdm_miss_poison_enable: coverpoint e.poison_enabled
+      iff (e.error_valid && e.error_type == 2'b01) {
+      bins apb_poison_disabled = {1'b0};
+      bins apb_poison_enabled  = {1'b1};
+    }
+
+    cr_fe_hdm_miss_x_nxm_x_poison: cross cp_fe_hdm_miss,
+      cp_fe_hdm_miss_nxm_enable, cp_fe_hdm_miss_poison_enable;
 
     cp_fe_dcd_permission_valid: coverpoint e.permission_valid iff (e.error_valid) {
       bins not_checked = {1'b0};
@@ -1544,6 +1699,10 @@ endgroup : cg_fe_tag_fifo
   //extern function void sample_all_credits();
   extern function void sample_req_inputs(kb_cxl_m2s_snap snap);
   extern function void sample_rwd_inputs(kb_cxl_m2s_snap snap);
+  extern function void sample_hdm_boundary(
+    input bit is_write,
+    input bit [45:0] hpa
+  );
   extern function void sample_ndr_outputs(kb_cxl_s2m_snap snap);
   extern function void sample_drc_outputs(kb_cxl_s2m_snap snap);
   extern function bit calculate_req_parity_error(kb_cxl_m2s_snap snap,
@@ -1573,6 +1732,15 @@ endgroup : cg_fe_tag_fifo
     int unsigned count
   );
   extern task sample_credit_counters_from_regblock();
+  extern task sample_hdm_region_counters_from_regblock();
+  extern task sample_dcd_ecc_counters_from_regblock();
+  extern task sample_egress_backpressure_from_regblock();
+  extern task peek_hdm_region_counter(
+    input uvm_reg msb_reg,
+    input uvm_reg lsb_reg,
+    output bit sample_valid,
+    output bit [63:0] counter_value
+  );
   extern task sample_scoreboard_items();
   extern function void sample_hdm_event(input hdm_cov_event_t sample_data);
   extern function void queue_hdm_tag(input bit is_write, input hdm_tag_result_t tag_result);
@@ -1650,6 +1818,25 @@ endfunction : build_phase
 
 function void kb_fwd_eng_coverage::reset_config_shadow();
   reset_hdm_tag_queues();
+  write_backpressure_seen = 1'b0;
+  read_backpressure_seen = 1'b0;
+  write_fill_class_prev = '0;
+  read_fill_class_prev = '0;
+  foreach (dcd_sec_count_prev[i]) begin
+    dcd_sec_count_prev[i] = '0;
+    dcd_ded_count_prev[i] = '0;
+    dcd_sec_count_seen[i] = 1'b0;
+    dcd_ded_count_seen[i] = 1'b0;
+  end
+  hdm_rd_region_count_q.delete();
+  hdm_wr_region_count_q.delete();
+  foreach (reg_hpa_base[i]) begin
+    reg_hpa_base[i] = '0;
+    reg_hpa_top[i]  = '0;
+    reg_dpa_base[i] = '0;
+    hdm_rd_region_count_q.push_back(64'd0);
+    hdm_wr_region_count_q.push_back(64'd0);
+  end
   req_order_known = 1'b0;
   rwd_order_known = 1'b0;
   req_comb_snapshot_sample = 1'b0;
@@ -1662,6 +1849,8 @@ function void kb_fwd_eng_coverage::reset_config_shadow();
   unsupported_field_check_enable_inst  = 1'b1;
   tag_range_check                     = 1'b0;
   poison_crc_invert_enable_inst        = 1'b1;
+  nxm_enable                           = 1'b0;
+  poison_enable                        = 1'b0;
   fe_error_status_inst                 = '0;
   fe_error_status_prev                 = '0;
   fe_error_status_prev_valid           = 1'b0;
@@ -1723,6 +1912,9 @@ task kb_fwd_eng_coverage::cxl_configure();
 
     reset_seen = 1'b0;
     sample_credit_counters_from_regblock();
+    sample_hdm_region_counters_from_regblock();
+    sample_dcd_ecc_counters_from_regblock();
+    sample_egress_backpressure_from_regblock();
     sample_req_inputs(h_cxl_m2s_items);
     sample_rwd_inputs(h_cxl_m2s_items);
     sample_ndr_outputs(h_cxl_s2m_items);
@@ -1767,6 +1959,202 @@ task kb_fwd_eng_coverage::sample_credit_counters_from_regblock();
   if (status == UVM_IS_OK)
     sample_credit_count(1'b1, int'(count));
 endtask : sample_credit_counters_from_regblock
+
+// Read a coherent 64-bit counter through the same RTL backdoor used by
+// sample_credit_counters_from_regblock(). No APB read side effects are applied.
+task kb_fwd_eng_coverage::peek_hdm_region_counter(
+  input uvm_reg msb_reg,
+  input uvm_reg lsb_reg,
+  output bit sample_valid,
+  output bit [63:0] counter_value
+);
+  uvm_status_e status;
+  uvm_reg_data_t msb_before;
+  uvm_reg_data_t lsb;
+  uvm_reg_data_t msb_after;
+
+  sample_valid = 1'b0;
+  counter_value = '0;
+  if (msb_reg == null || lsb_reg == null) return;
+
+  // Retry if low-half rollover changes the MSB between peeks.
+  for (int attempt = 0; attempt < 3; attempt++) begin
+    msb_reg.peek(status, msb_before, "RTL");
+    if (status != UVM_IS_OK || $isunknown(msb_before[31:0])) return;
+
+    lsb_reg.peek(status, lsb, "RTL");
+    if (status != UVM_IS_OK || $isunknown(lsb[31:0])) return;
+
+    msb_reg.peek(status, msb_after, "RTL");
+    if (status != UVM_IS_OK || $isunknown(msb_after[31:0])) return;
+
+    if (msb_before[31:0] == msb_after[31:0]) begin
+      counter_value = {msb_after[31:0], lsb[31:0]};
+      sample_valid = 1'b1;
+      return;
+    end
+  end
+  // Leave sample_valid low; the next CXL snapshot will retry.
+endtask : peek_hdm_region_counter
+
+// Each queue entry is the last successfully observed count for its region.
+// A nonzero first observation also hits, because reset initializes counts to 0.
+// One sample records an observed increase, not every individual counted access.
+task kb_fwd_eng_coverage::sample_hdm_region_counters_from_regblock();
+  bit counter_valid;
+  bit [63:0] counter_value;
+  hdm_cov_event_t region_sample;
+
+  if (reset_seen) return;
+  foreach (reg_hpa_base[i]) begin
+    peek_hdm_region_counter(
+      h_env_cfg.h_regblock.hdm_decoder[i].rd_region_msb,
+      h_env_cfg.h_regblock.hdm_decoder[i].rd_region_lsb,
+      counter_valid,
+      counter_value
+    );
+    if (reset_seen) return;
+    if (counter_valid) begin
+      if (counter_value > hdm_rd_region_count_q[i]) begin
+        region_sample = '0;
+        region_sample.is_write = 1'b0;
+        region_sample.region_sample_valid = 1'b1;
+        region_sample.region_index = i[3:0];
+        sample_hdm_event(region_sample);
+      end
+      // A decrease re-establishes the baseline without inventing a new hit.
+      hdm_rd_region_count_q[i] = counter_value;
+    end
+
+    peek_hdm_region_counter(
+      h_env_cfg.h_regblock.hdm_decoder[i].wr_region_msb,
+      h_env_cfg.h_regblock.hdm_decoder[i].wr_region_lsb,
+      counter_valid,
+      counter_value
+    );
+    if (reset_seen) return;
+    if (counter_valid) begin
+      if (counter_value > hdm_wr_region_count_q[i]) begin
+        region_sample = '0;
+        region_sample.is_write = 1'b1;
+        region_sample.region_sample_valid = 1'b1;
+        region_sample.region_index = i[3:0];
+        sample_hdm_event(region_sample);
+      end
+      hdm_wr_region_count_q[i] = counter_value;
+    end
+  end
+endtask : sample_hdm_region_counters_from_regblock
+
+// Sample the first valid observation (including zero), then only changes.
+// A nonzero value samples found; zero samples not-found.
+// Indices 0/1 are AW LSB/MSB; indices 2/3 are AR LSB/MSB.
+task kb_fwd_eng_coverage::sample_dcd_ecc_counters_from_regblock();
+  uvm_status_e status;
+  uvm_reg_data_t count;
+  hdm_cov_event_t ecc_sample;
+
+  if (reset_seen) return;
+  for (int i = 0; i < 4; i++) begin
+    h_env_cfg.h_regblock.fe_error_counters.dcd_sec_cnt[i].peek(
+      status, count, "RTL"
+    );
+    if (reset_seen) return;
+    if (status == UVM_IS_OK && !$isunknown(count[31:0])) begin
+      if (!dcd_sec_count_seen[i] || count[31:0] != dcd_sec_count_prev[i]) begin
+        ecc_sample = '0;
+        ecc_sample.is_write = (i < 2);
+        ecc_sample.ecc_sec_sample_valid = 1'b1;
+        ecc_sample.ecc_half_msb = i[0];
+        ecc_sample.ecc_found = (count[31:0] != 0);
+        sample_hdm_event(ecc_sample);
+      end
+      dcd_sec_count_prev[i] = count[31:0];
+      dcd_sec_count_seen[i] = 1'b1;
+    end
+
+    h_env_cfg.h_regblock.fe_error_counters.dcd_ded_cnt[i].peek(
+      status, count, "RTL"
+    );
+    if (reset_seen) return;
+    if (status == UVM_IS_OK && !$isunknown(count[31:0])) begin
+      if (!dcd_ded_count_seen[i] || count[31:0] != dcd_ded_count_prev[i]) begin
+        ecc_sample = '0;
+        ecc_sample.is_write = (i < 2);
+        ecc_sample.ecc_ded_sample_valid = 1'b1;
+        ecc_sample.ecc_half_msb = i[0];
+        ecc_sample.ecc_found = (count[31:0] != 0);
+        sample_hdm_event(ecc_sample);
+      end
+      dcd_ded_count_prev[i] = count[31:0];
+      dcd_ded_count_seen[i] = 1'b1;
+    end
+  end
+endtask : sample_dcd_ecc_counters_from_regblock
+
+// Sample live devload and each fill-level class on its first observation
+// or when it moves into another bin.
+task kb_fwd_eng_coverage::sample_egress_backpressure_from_regblock();
+  uvm_status_e status;
+  uvm_reg_data_t fill_level;
+  bit write_valid;
+  bit read_valid;
+  bit [7:0] write_fill_level;
+  bit [7:0] read_fill_level;
+  bit [1:0] write_fill_class;
+  bit [1:0] read_fill_class;
+
+  if (reset_seen) return;
+  write_valid = 1'b0;
+  read_valid = 1'b0;
+  write_fill_level = '0;
+  read_fill_level = '0;
+
+  h_env_cfg.h_regblock.egress_queue_registers.devload_congestion_threshold.peek(
+    status, fill_level, "RTL"
+  );
+  if (reset_seen) return;
+  if (status == UVM_IS_OK && !$isunknown(fill_level[3:0])) begin
+    write_egress_queue_devload = fill_level[3:2];
+    read_egress_queue_devload = fill_level[1:0];
+    cg_fe_egress_queue.sample(1'b1, 1'b0, 1'b0, 1'b0, 1'b0);
+  end
+
+  h_env_cfg.h_regblock.fifo_occupancy_register.egress_ar_w_aw_fill_level.egress_aw_fill_level.peek(
+    status, fill_level, "RTL"
+  );
+  if (reset_seen) return;
+  if (status == UVM_IS_OK && !$isunknown(fill_level[7:0])) begin
+    write_fill_level = fill_level[7:0];
+    write_fill_class = (write_fill_level == 0) ? 2'd0 :
+                       (write_fill_level <= 8'd32) ? 2'd1 :
+                       (write_fill_level < 8'd64) ? 2'd2 : 2'd3;
+    write_valid = !write_backpressure_seen ||
+                  (write_fill_class != write_fill_class_prev);
+    write_fill_class_prev = write_fill_class;
+    write_backpressure_seen = 1'b1;
+  end
+
+  h_env_cfg.h_regblock.fifo_occupancy_register.egress_ar_w_aw_fill_level.egress_ar_fill_level.peek(
+    status, fill_level, "RTL"
+  );
+  if (reset_seen) return;
+  if (status == UVM_IS_OK && !$isunknown(fill_level[7:0])) begin
+    read_fill_level = fill_level[7:0];
+    read_fill_class = (read_fill_level == 0) ? 2'd0 :
+                      (read_fill_level <= 8'd32) ? 2'd1 :
+                      (read_fill_level < 8'd64) ? 2'd2 : 2'd3;
+    read_valid = !read_backpressure_seen ||
+                 (read_fill_class != read_fill_class_prev);
+    read_fill_class_prev = read_fill_class;
+    read_backpressure_seen = 1'b1;
+  end
+
+  if (write_valid || read_valid)
+    cg_fe_egress_queue.sample(
+      1'b0, write_valid, read_valid, write_fill_level, read_fill_level
+    );
+endtask : sample_egress_backpressure_from_regblock
 
 task kb_fwd_eng_coverage::axi_configure();
   fork
@@ -1914,6 +2302,92 @@ function bit kb_fwd_eng_coverage::calculate_drs_parity_error(
   return parity_error;
 endfunction : calculate_drs_parity_error
 
+// Classify one accepted CXL address against the programmed HDM regions.
+// The comparison intentionally uses only HPA[51:28]. The CXL monitor supplies
+// HPA[51:6], so hpa[45:22] is the matching 24-bit field. HPA[27:6] is ignored.
+function void kb_fwd_eng_coverage::sample_hdm_boundary(
+  input bit is_write,
+  input bit [45:0] hpa
+);
+  hdm_cov_event_t boundary_sample;
+  bit             classification_valid;
+  bit [1:0]       classification;
+  bit             excluded_candidate_valid;
+  bit [23:0]      hpa_51_28;
+  bit [23:0]      excluded_candidate_base;
+
+  classification_valid     = 1'b0;
+  classification           = '0;
+  excluded_candidate_valid = 1'b0;
+  hpa_51_28                 = hpa[45:22];
+  excluded_candidate_base  = '0;
+
+  // First priority: an exact base is included. This also handles an
+  // adjacent handoff where one region's exclusive top is the next base.
+  foreach (reg_hpa_base[i]) begin
+    if (reg_hpa_top[i] > reg_hpa_base[i] &&
+        hpa_51_28 == reg_hpa_base[i]) begin
+      classification_valid = 1'b1;
+      classification       = 2'd0;
+      break;
+    end
+  end
+
+  // Second priority: the final included HPA[51:28] value is top-1.
+  // A one-unit region was already classified as its base above.
+  if (!classification_valid) begin
+    foreach (reg_hpa_base[i]) begin
+      if (reg_hpa_top[i] > reg_hpa_base[i] &&
+          hpa_51_28 == (reg_hpa_top[i] - 24'd1)) begin
+        classification_valid = 1'b1;
+        classification       = 2'd2;
+        break;
+      end
+    end
+  end
+
+  // Third priority: a strict interior address. Base and top-1 are excluded
+  // here because they have dedicated bins.
+  if (!classification_valid) begin
+    foreach (reg_hpa_base[i]) begin
+      if (reg_hpa_top[i] > reg_hpa_base[i] &&
+          hpa_51_28 > reg_hpa_base[i] &&
+          hpa_51_28 < (reg_hpa_top[i] - 24'd1)) begin
+        classification_valid = 1'b1;
+        classification       = 2'd1;
+        break;
+      end
+    end
+  end
+
+  // If the address did not belong to a region, associate it with the
+  // nearest programmed region below it. This yields one excluded sample,
+  // rather than one false sample for every lower-numbered region.
+  if (!classification_valid) begin
+    foreach (reg_hpa_base[i]) begin
+      if (reg_hpa_top[i] > reg_hpa_base[i] &&
+          hpa_51_28 >= reg_hpa_top[i] &&
+          (!excluded_candidate_valid ||
+           reg_hpa_base[i] > excluded_candidate_base)) begin
+        excluded_candidate_valid = 1'b1;
+        excluded_candidate_base  = reg_hpa_base[i];
+      end
+    end
+    if (excluded_candidate_valid) begin
+      classification_valid = 1'b1;
+      classification       = 2'd3;
+    end
+  end
+
+  if (classification_valid) begin
+    boundary_sample                       = '0;
+    boundary_sample.is_write              = is_write;
+    boundary_sample.boundary_sample_valid = 1'b1;
+    boundary_sample.boundary_class        = classification;
+    sample_hdm_event(boundary_sample);
+  end
+endfunction : sample_hdm_boundary
+
 function void kb_fwd_eng_coverage::sample_req_inputs(
   kb_cxl_m2s_snap snap
 );
@@ -1973,6 +2447,8 @@ function void kb_fwd_eng_coverage::sample_req_inputs(
       req_tag[i]        = snap.req_items[i].tag;
       req_hpa[i]        = snap.req_items[i].hpa;
       req_ld_id[i]      = snap.req_items[i].ld_id;
+
+      sample_hdm_boundary(1'b0, req_hpa[i]);
 
       req_seen_valid[i] = 1'b1;
       req_gap_cycles[i] = 0;
@@ -2122,6 +2598,8 @@ function void kb_fwd_eng_coverage::sample_rwd_inputs(
       rwd_hpa[i]        = snap.rwd_items[i].hpa;
       rwd_ld_id[i]      = snap.rwd_items[i].ld_id;
       rwd_poison[i]     = snap.rwd_items[i].poison;
+
+      sample_hdm_boundary(1'b1, rwd_hpa[i]);
       
       // Note: rwd_data and byte_enable are populated here for completeness, 
       // even if cg_fe_cxl_parser_rwd does not currently sample them.
@@ -2454,11 +2932,11 @@ task kb_fwd_eng_coverage::apb_configure(
 
   if (txn.Direction == DENALI_CDN_APB_DIRECTION_READ) begin
     case (txn.Addr)
-      'h81020: begin
+      'h81028: begin
       write_egress_queue_devload = txn.Data[3:2];
       read_egress_queue_devload  = txn.Data[1:0];
 
-      cg_fe_egress_queue.sample();
+      cg_fe_egress_queue.sample(1'b1, 1'b0, 1'b0, 1'b0, 1'b0);
     end
 
       'h80a00: begin // fe_error_status: 20 bits, read-clear
@@ -2483,8 +2961,10 @@ task kb_fwd_eng_coverage::apb_configure(
   if (txn.Direction != DENALI_CDN_APB_DIRECTION_WRITE)
     return;
 
-  // Ten HDM instances, seven 32-bit registers each.
-  // Only offsets 0x00, 0x04 and 0x08 are software writable.
+  // Region i starts at 0x80300 + i*0x1C.
+  // +00 HPA base, +04 HPA top, +08 DPA base: writable, 24-bit shadows.
+  // +0C/+10 RD MSB/LSB, +14/+18 WR MSB/LSB: read-only counters,
+  // captured through the region-counter peek task rather than APB writes.
   if (txn.Addr >= 'h80300 &&
       txn.Addr < ('h80300 + 10 * 'h1c)) begin
     idx    = (txn.Addr - 'h80300) / 'h1c;
@@ -2814,6 +3294,8 @@ task kb_fwd_eng_coverage::sample_scoreboard_items();
         hdm_sample.tag_range_checked = tag_range_checked[i];
         hdm_sample.tag_range_passed  = tag_range_passed[i];
         hdm_sample.error_type        = err_resp_type[i];
+        hdm_sample.nxm_enabled       = nxm_enable;
+        hdm_sample.poison_enabled    = poison_enable;
         hdm_sample.is_write          = h_txn.is_write;
         hdm_sample.permission_valid  = h_txn.permission_checked[i];
         hdm_sample.permission_passed = h_txn.permission_passed[i];
