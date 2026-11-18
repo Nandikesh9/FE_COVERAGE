@@ -95,6 +95,9 @@ class kb_fwd_eng_coverage extends uvm_component;
   uvm_tlm_analysis_fifo #(kb_cxl_m2s_snap) cxl_m2s_bus_fifo;
   uvm_tlm_analysis_fifo #(kb_cxl_s2m_snap) cxl_s2m_bus_fifo;
 
+  // Error-status snapshots published by the IRQ service path.
+  uvm_tlm_analysis_fifo #(logic [19:0]) irq_fifo;
+
   //AXI_FIFO's
   kb_axi4_analysis_fifo address_fifo;
   kb_axi4_analysis_fifo w_fifo;
@@ -2470,14 +2473,10 @@ endgroup : cg_fe_tag_fifo
     // Cross each asserted status source with its mapped enable and observed IRQ.
     // AW/W threshold sources share enable bit 14, as defined by the RDL.
     cr_fe_error_status_x_irq_enable:
-      cross cp_fe_error_source, cp_fe_source_irq_enable, cp_fe_irq_line
+      cross flit_mode_inst, cp_fe_error_source, cp_fe_source_irq_enable, cp_fe_irq_line
       iff (source_valid && source_irq_valid && irq_line_valid) {
       ignore_bins no_irq_enable = binsof(cp_fe_error_source.axi_rresp_rlast_0);
     }
-
-    // Cross with flit_mode and individual error source
-
-    cr_flit_x_error_src : cross flit_mode_inst, cp_fe_error_source iff (source_valid);
   endgroup : cg_fe_error_interrupt
 
   extern function new(string name = "kb_fwd_eng_coverage",
@@ -2489,6 +2488,7 @@ endgroup : cg_fe_tag_fifo
   extern task apb();
   extern task cxl_configure();
   extern task axi_configure();
+  extern task sample_irq_status_from_fifo();
   //extern function void sample_all_credits();
   extern function void sample_combining_eligibility(
     kb_cxl_m2s_snap snap, bit is_write, int unsigned first_lane
@@ -2571,6 +2571,9 @@ function kb_fwd_eng_coverage::new(
 
   //apb_fifo
   apb_fifo         = new("h_apb_fifo", this);
+
+  // IRQ error-status FIFO
+  irq_fifo         = new("h_irq_fifo", this);
 
   //cxl_fifo's
   cxl_m2s_bus_fifo = new("h_cxl_m2s", this);
@@ -2712,8 +2715,29 @@ task kb_fwd_eng_coverage::run_phase(uvm_phase phase);
     cxl_configure();
     axi_configure();
     sample_scoreboard_items();
+
+    sample_irq_status_from_fifo();
   join_none
 endtask : run_phase
+
+// The IRQ FIFO carries status only. Use the latest IRQ line observation from
+// the CXL monitor for the other two sample arguments.
+task kb_fwd_eng_coverage::sample_irq_status_from_fifo();
+  logic [19:0] status_from_irq;
+
+  forever begin
+    irq_fifo.get(status_from_irq);
+
+    if (reset_seen) continue;
+
+    sample_error_interrupt(
+      status_from_irq,
+      fe_irq_line_inst,
+      fe_irq_line_valid
+    );
+    cg_fe_apb_registers.sample(1'b0, 1'b0, 1'b1);
+  end
+endtask : sample_irq_status_from_fifo
 
 task kb_fwd_eng_coverage::apb();
   forever begin
@@ -3861,16 +3885,9 @@ task kb_fwd_eng_coverage::apb_configure(
 
     end
 
-      'h80a00: begin // fe_error_status: 20 bits, read-clear
-        // Latest consumed S2M observation, not a guaranteed pre-clear IRQ:
-        // APB and CXL FIFOs are independent. For cycle-aligned coverage,
-        // pass IRQ captured with the APB status read to this helper instead.
-        sample_error_interrupt(txn.Data[19:0], fe_irq_line_inst, fe_irq_line_valid);
-        cg_fe_apb_registers.sample(1'b0, 1'b0, 1'b1);
-
-        
-        // The returned value has been covered; do not replay it on writes.
-        fe_error_status_inst = '0;
+      'h80a00: begin // fe_error_status: coverage samples status from irq_fifo
+        // This register is write-on-clear now. An APB read neither supplies
+        // the status coverage event nor clears the local status shadow.
       end
       'h80600: begin // cxl_mem_mst_req: software read-only
         mst_req = txn.Data[0];
@@ -4467,6 +4484,7 @@ function void kb_fwd_eng_coverage::report_phase(uvm_phase phase);
 endfunction : report_phase
 
 `endif // KB_FWD_ENG_COVERAGE_SV
+
 
 
 
